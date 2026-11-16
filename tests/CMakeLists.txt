@@ -366,6 +366,11 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+llama_build_and_test(test-expert-cache.cpp ../src/llama-expert-cache.cpp LINK ggml Threads::Threads LABEL behavior
+    ARGS "${CMAKE_CURRENT_BINARY_DIR}/expert-cache-test")
+target_include_directories(test-expert-cache PRIVATE ../src)
+set_tests_properties(test-expert-cache PROPERTIES TIMEOUT 60)
+
 if (GGML_CPU AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-external-expert.cpp LINK ggml LABEL behavior
         ARGS "${CMAKE_CURRENT_BINARY_DIR}/external-expert-weights.bin")

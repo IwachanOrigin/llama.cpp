@@ -49,3 +49,46 @@ destruction to check that the files can be released on Windows.
 It also runs two independent llama contexts concurrently against the same mmap
 model and compares both traces against the same reference. The contexts and all
 their work must finish before destroying the model.
+
+## Phase 1B-3A cache tests
+
+```sh
+cmake --build build --config Release --target test-expert-cache
+ctest --test-dir build -C Release -R '^test-expert-cache$' --output-on-failure -V
+```
+
+The test uses two small files with deterministic Expert byte patterns. Three
+source IDs map to those files so two tensor sources can share a shard. Tests
+trigger reader entry and completion with condition variables and use deadlines
+for all concurrent scenarios.
+
+The cache is constructed once with a byte budget and maximum slice size. Its
+accounting includes the cache object, padded slot metadata (including intrusive
+LRU links), and one 64-byte-aligned payload per slot. The reader fills this
+payload directly. The cache owns no additional read buffer, dynamic key index,
+or heap-allocated lease record. A lease is a move-only value held by its caller.
+Allocator and OS bookkeeping, file handles owned by the reader, the OS file
+cache, ggml workspace, and KV cache are outside this standalone cache's budget.
+
+The cache mutex protects state, statistics, wait registrations, and LRU links.
+The reader is called after unlocking the cache; it may take its shard I/O mutex
+to serialize seek and read. It must release the shard mutex before returning
+and must not acquire from the same cache from the reader callback. On return,
+the cache mutex is reacquired to publish success or failure. A successful
+lease pins a slot without holding either mutex. Waiting callers for the
+same load see its result before the slot is eligible for eviction or reuse.
+Release may run on a different thread. All acquires and leases must finish
+before cache destruction.
+Each CPU execution team releases its current Expert before waiting for another
+key, so it cannot block on capacity that only its own release would free.
+
+`cache_misses` and `disk_reads` count reader starts, including failures.
+`bytes_read` counts bytes from complete reads. A successful coalesced request
+is a hit. I/O time measures reader wall time (including a shard-lock wait),
+and cache wait time measures condition-variable waits. Both timers aggregate
+across threads.
+
+Phase 1B-3B can give each model one shared cache, assign stable IDs to its
+registered tensor sources, and use a shard-locked reader for
+`llama_file::read_exact_at()`. The current model loader and single-slot CPU
+provider still use the Phase 1B-2A path.
