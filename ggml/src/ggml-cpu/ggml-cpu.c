@@ -511,6 +511,7 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+    const char * external_expert_data;
 };
 
 // Per-thread state
@@ -1599,6 +1600,12 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const struct ggml_cpu_external_expert_source * external = NULL;
+    if (src0->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) {
+        GGML_ASSERT(src0->buffer && !src0->data && !src0->view_src && ggml_is_contiguous(src0) && ne03 == 1);
+        external = src0->extra;
+        GGML_ASSERT(external && external->acquire && external->release);
+    }
 
     void * wdata_cur = params->wdata;
 
@@ -1695,12 +1702,29 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // The tiled path currently requires directly addressable weights.
+        if (!external && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur;
+        struct ggml_cpu_external_expert_lease lease = { 0 };
+        if (external) {
+            if (ith == 0) {
+                lease = external->acquire(external->context, cur_a, nb02);
+                params->threadpool->external_expert_data = lease.data;
+            }
+            ggml_barrier(params->threadpool);
+            src0_cur = params->threadpool->external_expert_data;
+            if (!src0_cur) {
+                if (ith == 0) {
+                    params->threadpool->ec = GGML_STATUS_FAILED;
+                }
+                return;
+            }
+        } else {
+            src0_cur = (const char *) src0->data + cur_a * nb02;
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1752,6 +1776,13 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+        if (external) {
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                external->release(external->context, lease.token);
+                params->threadpool->external_expert_data = NULL;
+            }
+        }
     }
 }
 
@@ -1765,7 +1796,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     // extra_buffer op?
-    if (ggml_cpu_extra_compute_forward(params, tensor)) {
+    const bool external = tensor->src[0] && (tensor->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT);
+    if (!external && ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
 
@@ -2851,13 +2883,17 @@ struct ggml_cplan ggml_graph_plan(
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
+        if (!ggml_cpu_external_expert_op_supported(node)) {
+            continue;
+        }
         const int n_tasks = ggml_get_n_tasks(node, n_threads);
 
         max_tasks = MAX(max_tasks, n_tasks);
 
         size_t cur = 0;
 
-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+        const bool external = node->src[0] && (node->src[0]->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT);
+        if (external || !ggml_cpu_extra_work_size(n_threads, node, &cur)) {
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
@@ -3156,10 +3192,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
-        if (state->ith == 0 && cplan->abort_callback &&
-                cplan->abort_callback(cplan->abort_callback_data)) {
-            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
-            tp->ec    = GGML_STATUS_ABORTED;
+        if (state->ith == 0) {
+            if (tp->ec == GGML_STATUS_FAILED) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+            } else if (cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                tp->ec = GGML_STATUS_ABORTED;
+            }
         }
 
         if (node_n + 1 < cgraph->n_nodes) {
@@ -3398,6 +3437,11 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (!ggml_cpu_external_expert_op_supported(cgraph->nodes[i])) {
+            return GGML_STATUS_FAILED;
+        }
+    }
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);

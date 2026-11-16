@@ -366,6 +366,29 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+if (GGML_CPU AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-external-expert.cpp LINK ggml LABEL behavior
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/external-expert-weights.bin")
+    target_include_directories(test-external-expert PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    set_tests_properties(test-external-expert PROPERTIES TIMEOUT 30)
+endif()
+
+if (GGML_CPU AND LLAMA_BUILD_TOOLS AND NOT CMAKE_CROSSCOMPILING AND NOT EMSCRIPTEN)
+    find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+    if (Python3_Interpreter_FOUND)
+        set(LLAMA_TEST_NAME test-qwen3moe-lazy)
+        llama_build(moe-paging/compare.cpp LINK llama ggml)
+        unset(LLAMA_TEST_NAME)
+        add_dependencies(test-qwen3moe-lazy llama-gguf-split)
+        add_test(NAME test-qwen3moe-lazy COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
+            $<TARGET_FILE:test-qwen3moe-lazy> $<TARGET_FILE:llama-gguf-split>)
+        set_tests_properties(test-qwen3moe-lazy PROPERTIES LABELS behavior TIMEOUT 120)
+    endif()
+endif()
+
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 
 if (BUILD_SHARED_LIBS)

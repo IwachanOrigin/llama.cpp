@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -92,6 +93,63 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
         }
     }
     return false;
+}
+
+static ggml_backend_buffer_type_t ggml_cpu_external_expert_buffer_type() {
+    static ggml_backend_buffer_type buft = [] {
+        ggml_backend_buffer_type type{};
+        type.iface.get_name = [](ggml_backend_buffer_type_t) -> const char * { return "CPU_ExternalExpert"; };
+        type.iface.get_alignment = [](ggml_backend_buffer_type_t) -> size_t { return GGML_MEM_ALIGN; };
+        type.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t) -> ggml_backend_buffer_t { return nullptr; };
+        type.device = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+        return type;
+    }();
+    return &buft;
+}
+
+ggml_backend_buffer_t ggml_cpu_external_expert_buffer_create(void) {
+    auto buffer = ggml_backend_buft_alloc_buffer(ggml_cpu_external_expert_buffer_type(), 0);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return buffer;
+}
+
+static bool ggml_cpu_is_external_expert(const ggml_tensor * tensor) {
+    return tensor && ((tensor->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) ||
+            (tensor->buffer && tensor->buffer->buft == ggml_cpu_external_expert_buffer_type()));
+}
+
+bool ggml_cpu_external_expert_op_supported(const ggml_tensor * op) {
+    if (ggml_cpu_is_external_expert(op) || ggml_cpu_is_external_expert(op->view_src)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = op->src[i];
+        if (!src) {
+            continue;
+        }
+        if (ggml_cpu_is_external_expert(src->view_src)) {
+            return false;
+        }
+        if (!ggml_cpu_is_external_expert(src)) {
+            continue;
+        }
+        if (i != 0 || op->op != GGML_OP_MUL_MAT_ID || !(src->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) ||
+                !src->buffer || src->buffer->buft != ggml_cpu_external_expert_buffer_type() ||
+                src->buffer->size != 0 || src->data || src->view_src || !ggml_is_contiguous(src) || src->ne[3] != 1) {
+            return false;
+        }
+        const auto * provider = static_cast<const ggml_cpu_external_expert_source *>(src->extra);
+        if (!provider || !provider->acquire || !provider->release || !op->src[1] || !op->src[2]) {
+            return false;
+        }
+        for (int j = 1; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * other = op->src[j];
+            if (other && other->buffer && ggml_backend_cpu_is_extra_buffer_type(other->buffer->buft)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // CPU backend - backend (stream)
@@ -425,6 +483,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    if (!ggml_cpu_external_expert_op_supported(op)) {
+        return false;
+    }
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
@@ -488,7 +550,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 }
 
 static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
+    return ggml_backend_buft_is_host(buft) || buft == ggml_cpu_external_expert_buffer_type() ||
+        ggml_backend_cpu_is_extra_buffer_type(buft);
     GGML_UNUSED(dev);
 }
 
