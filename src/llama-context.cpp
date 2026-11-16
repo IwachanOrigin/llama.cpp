@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -3061,10 +3062,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     if (split_only) {
-        if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
-        } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
+        const bool ok = sizes ? ggml_backend_sched_try_reserve_size(sched.get(), gf, sizes) :
+            ggml_backend_sched_try_split_graph(sched.get(), gf);
+        if (!ok) {
+            return nullptr;
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);

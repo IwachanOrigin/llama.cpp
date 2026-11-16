@@ -1,5 +1,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
 
@@ -137,6 +138,39 @@ static bool equal_bytes(const result & a, const result & b) {
     return std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
 
+static void test_scheduler_allocation_retry(ggml_backend_t backend, ggml_tensor * weights) {
+    bool fail = true;
+    ggml_backend_buffer_type buft{};
+    buft.context = &fail;
+    buft.iface.get_name = [](ggml_backend_buffer_type_t) -> const char * { return "CPU_AllocationTest"; };
+    buft.iface.get_alignment = [](ggml_backend_buffer_type_t) {
+        return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+    };
+    buft.iface.is_host = [](ggml_backend_buffer_type_t) { return true; };
+    buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t type, size_t size) {
+        return *static_cast<bool *>(type->context) ? nullptr :
+            ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    };
+    ggml_backend_buffer_type_t scheduler_buft = &buft;
+    auto * sched = ggml_backend_sched_new(&backend, &scheduler_buft, 1, 32, false, false);
+    auto * ctx = ggml_init({ 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true });
+    GGML_ASSERT(ctx);
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, tokens);
+    auto * output = ggml_mul_mat_id(ctx, weights, input, ids);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    GGML_ASSERT(!ggml_backend_sched_reserve(sched, graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched) == 0);
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched) == 0);
+    fail = false;
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(output->data && !weights->data);
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+}
+
 static void test(int threads, const char * path) {
     auto * backend = ggml_backend_cpu_init();
     GGML_ASSERT(backend);
@@ -215,6 +249,41 @@ static void test(int threads, const char * path) {
     const auto * matmul = paged.output->src[0];
     GGML_ASSERT(ggml_backend_dev_supports_op(device, matmul));
     GGML_ASSERT(!ggml_backend_buffer_is_host(paged.weights->buffer));
+    test_scheduler_allocation_retry(backend, paged.weights);
+
+    auto cpu_sched = ggml_backend_sched_new(&backend, nullptr, 1, 32, false, true);
+    size_t scheduled_bytes = 0;
+    GGML_ASSERT(ggml_backend_sched_try_reserve_size(cpu_sched, paged.graph, &scheduled_bytes));
+    GGML_ASSERT(scheduled_bytes < logical_bytes);
+    source.reset_counts();
+    GGML_ASSERT(ggml_backend_sched_graph_compute(cpu_sched, paged.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_backend_sched_get_tensor_backend(cpu_sched, paged.weights) == backend);
+    GGML_ASSERT(paged.weights->data == nullptr && source.requests == 2 && source.releases == 2);
+    GGML_ASSERT(equal_bytes(paged.read_output(), second));
+    source.reset_counts();
+    source.fail_id = 41;
+    GGML_ASSERT(ggml_backend_sched_graph_compute(cpu_sched, paged.graph) == GGML_STATUS_FAILED);
+    GGML_ASSERT(!source.held && source.requests == 2 && source.releases == 1);
+    source.reset_counts();
+    source.fail_id = -1;
+    GGML_ASSERT(ggml_backend_sched_graph_compute(cpu_sched, paged.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(equal_bytes(paged.read_output(), second));
+    ggml_backend_sched_reset(cpu_sched);
+
+    // Exercise an explicit non-CPU placement without a GPU driver.
+    ggml_backend_device other_device{};
+    other_device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
+    other_device.iface.supports_buft = [](ggml_backend_dev_t, ggml_backend_buffer_type_t) { return true; };
+    ggml_backend other_backend{};
+    other_backend.device = &other_device;
+    ggml_backend_t backends[] = { &other_backend, backend };
+    ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type(), ggml_backend_cpu_buffer_type() };
+    auto mixed_sched = ggml_backend_sched_new(backends, buffer_types, 2, 32, false, true);
+    ggml_backend_sched_set_tensor_backend(mixed_sched, paged.weights, &other_backend);
+    GGML_ASSERT(!ggml_backend_sched_try_split_graph(mixed_sched, paged.graph));
+    ggml_backend_sched_set_tensor_backend(mixed_sched, paged.output->src[0], &other_backend);
+    GGML_ASSERT(!ggml_backend_sched_try_split_graph(mixed_sched, paged.graph));
+    ggml_backend_sched_free(mixed_sched);
 
     source.reset_counts();
     auto * ordinary_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 0);
@@ -248,12 +317,31 @@ static void test(int threads, const char * path) {
     auto * copy = ggml_dup(paged.context, paged.weights);
     GGML_ASSERT(!ggml_backend_dev_supports_op(device, copy));
     ggml_build_forward_expand(paged.graph, copy);
+    GGML_ASSERT(!ggml_backend_sched_try_split_graph(cpu_sched, paged.graph));
     GGML_ASSERT(ggml_backend_graph_compute(backend, paged.graph) == GGML_STATUS_FAILED);
     GGML_ASSERT(source.requests == 0 && source.releases == 0);
     auto * view = ggml_view_tensor(paged.context, paged.weights);
     GGML_ASSERT(!ggml_backend_dev_supports_op(device, view));
     ggml_build_forward_expand(paged.graph, view);
     GGML_ASSERT(!ggml_gallocr_alloc_graph(paged.allocator, paged.graph));
+    auto * nested_view = ggml_view_tensor(paged.context, view);
+    nested_view->view_src = view; // ggml normally flattens views when creating them.
+    ggml_graph_clear(paged.graph);
+    ggml_build_forward_expand(paged.graph, nested_view);
+    GGML_ASSERT(!ggml_backend_sched_try_split_graph(cpu_sched, paged.graph));
+    size_t failed_size = SIZE_MAX;
+    GGML_ASSERT(!ggml_backend_sched_try_reserve_size(cpu_sched, paged.graph, &failed_size));
+    GGML_ASSERT(failed_size == SIZE_MAX);
+    GGML_ASSERT(!ggml_backend_sched_reserve(cpu_sched, paged.graph));
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph(cpu_sched, paged.graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(cpu_sched) == 0);
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(paged.allocator, paged.graph));
+    ggml_graph_clear(paged.graph);
+    ggml_build_forward_expand(paged.graph, paged.output);
+    GGML_ASSERT(ggml_backend_sched_reserve(cpu_sched, paged.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(cpu_sched, paged.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(equal_bytes(paged.read_output(), second));
+    ggml_backend_sched_free(cpu_sched);
     std::printf("threads=%d logical_weight=%zu resident_graph=%zu external_graph=%zu weight_slot=%zu bytes\n",
             threads, logical_bytes, resident_graph_bytes, graph_bytes, source.slice.capacity());
 

@@ -156,6 +156,13 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (params.external_experts) {
+        if (params.n_gpu_layers != 0 || (params.devices && params.devices[0])) {
+            LLAMA_LOG_ERROR("%s: external experts require n_gpu_layers = 0 and no explicit devices\n", __func__);
+            return false;
+        }
+        return true;
+    }
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -316,6 +323,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        if (params.external_experts && (fname.empty() || file || metadata || params.vocab_only)) {
+            throw std::runtime_error("external experts require a named GGUF model");
+        }
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 

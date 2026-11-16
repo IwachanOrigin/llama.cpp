@@ -10,6 +10,10 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 3
 
+    // Status-returning scheduler entry points for in-tree callers.
+    GGML_API bool ggml_backend_sched_try_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool ggml_backend_sched_try_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * sizes);
+
     //
     // Backend buffer type
     //

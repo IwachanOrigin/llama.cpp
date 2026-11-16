@@ -100,7 +100,10 @@ static ggml_backend_buffer_type_t ggml_cpu_external_expert_buffer_type() {
         ggml_backend_buffer_type type{};
         type.iface.get_name = [](ggml_backend_buffer_type_t) -> const char * { return "CPU_ExternalExpert"; };
         type.iface.get_alignment = [](ggml_backend_buffer_type_t) -> size_t { return GGML_MEM_ALIGN; };
-        type.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t) -> ggml_backend_buffer_t { return nullptr; };
+        type.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t size) -> ggml_backend_buffer_t {
+            GGML_LOG_ERROR("CPU_ExternalExpert cannot allocate %zu bytes\n", size);
+            return nullptr;
+        };
         type.device = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
         return type;
     }();
@@ -119,7 +122,7 @@ static bool ggml_cpu_is_external_expert(const ggml_tensor * tensor) {
 }
 
 bool ggml_cpu_external_expert_op_supported(const ggml_tensor * op) {
-    if (ggml_cpu_is_external_expert(op) || ggml_cpu_is_external_expert(op->view_src)) {
+    if (ggml_cpu_is_external_expert(op) || ggml_external_expert_root(op->view_src) || ggml_cpu_is_external_expert(op->view_src)) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -127,7 +130,7 @@ bool ggml_cpu_external_expert_op_supported(const ggml_tensor * op) {
         if (!src) {
             continue;
         }
-        if (ggml_cpu_is_external_expert(src->view_src)) {
+        if (ggml_external_expert_root(src->view_src) || ggml_cpu_is_external_expert(src->view_src)) {
             return false;
         }
         if (!ggml_cpu_is_external_expert(src)) {
@@ -727,6 +730,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cpu_device_get_extra_buffers_type;
         return (void *)fct;
+    }
+    if (strcmp(name, "ggml_cpu_external_expert_buffer_create") == 0) {
+        return (void *)ggml_cpu_external_expert_buffer_create;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cpu_get_features;

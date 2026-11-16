@@ -24,15 +24,19 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-impl.h"
+#include "ggml-cpu/external-expert.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1354,6 +1358,53 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+struct llama_external_experts {
+    struct tensor_source {
+        llama_external_experts * owner;
+        uint16_t shard;
+        size_t offset;
+        size_t stride;
+        int64_t count;
+        ggml_type type;
+        ggml_cpu_external_expert_source provider{ this, acquire, release };
+
+        static ggml_cpu_external_expert_lease acquire(void * context, int64_t expert, size_t bytes) noexcept {
+            auto & source = *static_cast<tensor_source *>(context);
+            auto & owner = *source.owner;
+            if (expert < 0 || expert >= source.count || bytes != source.stride || bytes > owner.slot.size()) {
+                return {};
+            }
+            try {
+                std::unique_lock<std::mutex> lock(owner.mutex);
+                owner.files.at(source.shard)->read_exact_at(source.offset + expert * source.stride, owner.slot.data(), bytes);
+                owner.bytes_read += bytes;
+                lock.release(); // The execution team releases the slot with this token.
+                return { owner.slot.data(), &owner };
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("external Expert read failed: shard=%u offset=%zu expert=%" PRId64 " type=%s: %s\n",
+                    unsigned(source.shard), source.offset, expert, ggml_type_name(source.type), e.what());
+                return {};
+            } catch (...) {
+                return {};
+            }
+        }
+
+        static void release(void * context, void * token) noexcept {
+            auto & source = *static_cast<tensor_source *>(context);
+            GGML_ASSERT(token == source.owner);
+            source.owner->mutex.unlock();
+        }
+    };
+
+    std::mutex mutex;
+    llama_files files;
+    ggml_backend_buffer_type_t buft = nullptr;
+    size_t planned_slot_bytes = 0;
+    uint64_t bytes_read = 0;
+    std::vector<uint8_t> slot;
+    std::vector<std::unique_ptr<tensor_source>> sources;
+};
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -1368,6 +1419,7 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    std::unique_ptr<llama_external_experts> external_experts;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1747,6 +1799,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    ggml_backend_buffer_ptr external_buffer;
+    if (params.external_experts) {
+        if (arch != LLM_ARCH_QWEN3MOE || params.check_tensors || use_mlock || ml.use_direct_io || has_tensor_overrides()) {
+            throw std::runtime_error("external experts require Qwen3MoE, buffered I/O or mmap, and no tensor validation or overrides");
+        }
+        auto * create = (decltype(ggml_cpu_external_expert_buffer_create) *) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(cpu_dev), "ggml_cpu_external_expert_buffer_create");
+        if (!create) {
+            throw std::runtime_error("CPU backend does not support external experts");
+        }
+        external_buffer.reset(create());
+        if (!external_buffer) {
+            throw std::runtime_error("failed to create external Expert buffer");
+        }
+        ml.external_expert_buft = ggml_backend_buffer_get_type(external_buffer.get());
+        pimpl->external_experts = std::make_unique<llama_external_experts>();
+        pimpl->external_experts->buft = ml.external_expert_buft;
+    }
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -2035,6 +2106,46 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
+        if (buft == ml.external_expert_buft) {
+            auto & external = *pimpl->external_experts;
+            size_t slot_bytes = 0;
+            size_t logical_bytes = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const auto & weight = ml.require_weight(t->name);
+                const size_t bytes = ggml_nbytes(t);
+                if (!(t->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) || t->data || t->view_src ||
+                        !ggml_is_contiguous(t) || t->ne[2] <= 0 || t->ne[3] != 1 ||
+                        !t->nb[2] || bytes % t->nb[2] || bytes / t->nb[2] != (size_t)t->ne[2] ||
+                        bytes > SIZE_MAX - logical_bytes) {
+                    throw std::runtime_error(format("invalid external Expert layout for '%s'", t->name));
+                }
+                auto source = std::make_unique<llama_external_experts::tensor_source>();
+                source->owner = &external;
+                source->shard = weight.idx;
+                source->offset = weight.offs;
+                source->stride = t->nb[2];
+                source->count = t->ne[2];
+                source->type = t->type;
+                t->buffer = external_buffer.get();
+                t->extra = &source->provider;
+                external.sources.push_back(std::move(source));
+                slot_bytes = std::max(slot_bytes, t->nb[2]);
+                logical_bytes += bytes;
+            }
+            if (!ml.no_alloc) {
+                external.slot.resize(slot_bytes);
+            }
+            external.planned_slot_bytes = slot_bytes;
+            const size_t buffer_bytes = ggml_backend_buffer_get_size(external_buffer.get());
+            LLAMA_LOG_INFO("external experts: tensors=%zu logical_bytes=%zu buffer_bytes=%zu slot_bytes=%zu\n",
+                external.sources.size(), logical_bytes, buffer_bytes, external.slot.capacity());
+            ctx_bufs.emplace_back(ctx, std::vector<ggml_backend_buffer_t>{ external_buffer.get() });
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(std::move(external_buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+            continue;
+        }
+
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) {
@@ -2172,6 +2283,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    if (pimpl->external_experts) {
+        auto & external = *pimpl->external_experts;
+        external.files = std::move(ml.files);
+        LLAMA_LOG_INFO("external experts: shards=%zu skipped_bytes=%zu initial_read_bytes=%" PRIu64 "\n",
+            external.files.size(), ml.external_expert_skipped_bytes, external.bytes_read);
+    }
 
     return true;
 }
@@ -2566,6 +2684,12 @@ bool llama_model::no_alloc() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        if (pimpl->external_experts && !bufs.empty() &&
+                ggml_backend_buffer_get_type(bufs.front().get()) == pimpl->external_experts->buft) {
+            const auto & external = *pimpl->external_experts;
+            ret[external.buft] += no_alloc() ? external.planned_slot_bytes : external.slot.capacity();
+            continue;
+        }
         if (no_alloc()) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
@@ -3565,6 +3689,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.external_experts            =*/ false,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

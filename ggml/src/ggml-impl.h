@@ -33,6 +33,15 @@ void ggml_print_backtrace(void);
 // Internal CPU MUL_MAT_ID experiment: requires the dedicated external Expert buffer and null data.
 #define GGML_TENSOR_FLAG_EXTERNAL_EXPERT (1 << 5)
 
+static inline const struct ggml_tensor * ggml_external_expert_root(const struct ggml_tensor * tensor) {
+    for (; tensor; tensor = tensor->view_src) {
+        if (tensor->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) {
+            return tensor;
+        }
+    }
+    return NULL;
+}
+
 uint64_t ggml_graph_next_uid(void);
 
 #ifndef MIN

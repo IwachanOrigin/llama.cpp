@@ -379,13 +379,17 @@ if (GGML_CPU AND LLAMA_BUILD_TOOLS AND NOT CMAKE_CROSSCOMPILING AND NOT EMSCRIPT
     find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
     if (Python3_Interpreter_FOUND)
         set(LLAMA_TEST_NAME test-qwen3moe-lazy)
-        llama_build(moe-paging/compare.cpp LINK llama ggml)
+        llama_build(moe-paging/compare.cpp LINK llama ggml Threads::Threads)
         unset(LLAMA_TEST_NAME)
         add_dependencies(test-qwen3moe-lazy llama-gguf-split)
         add_test(NAME test-qwen3moe-lazy COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
             $<TARGET_FILE:test-qwen3moe-lazy> $<TARGET_FILE:llama-gguf-split>)
         set_tests_properties(test-qwen3moe-lazy PROPERTIES LABELS behavior TIMEOUT 120)
+        add_test(NAME test-qwen3moe-external COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
+            $<TARGET_FILE:test-qwen3moe-lazy> $<TARGET_FILE:llama-gguf-split> external)
+        set_tests_properties(test-qwen3moe-external PROPERTIES LABELS behavior TIMEOUT 120)
     endif()
 endif()
 

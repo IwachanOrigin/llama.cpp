@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 #include "llama.h"
@@ -1434,7 +1435,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    const bool external_expert = external_expert_buft && tn.suffix && strcmp(tn.suffix, "weight") == 0 &&
+        (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS || tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS);
+    if (external_expert && use_mmap && !no_alloc) {
+        lazy.exclude_from_prefetch(require_weight(tn.str().c_str()));
+    }
+    if (!external_expert && (flags & TENSOR_READ_LAZY)) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
@@ -1455,7 +1461,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    ggml_backend_buffer_type_t buft = external_expert ? external_expert_buft : buft_for_tensor(&t_meta);
     if (buft == nullptr) {
         return nullptr;
     }
@@ -1474,6 +1480,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (external_expert) {
+        tensor->flags |= GGML_TENSOR_FLAG_EXTERNAL_EXPERT;
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1792,6 +1801,12 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (cur->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) {
+            external_expert_skipped_bytes += n_size;
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

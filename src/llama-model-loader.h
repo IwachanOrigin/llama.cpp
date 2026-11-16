@@ -41,10 +41,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
-            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (data_offset > file->size() || tensor_offset > file->size() - data_offset ||
+                    ggml_nbytes(tensor) > file->size() - data_offset - tensor_offset) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
+            offs = data_offset + tensor_offset;
         }
     };
 
@@ -107,6 +110,10 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
+        void exclude_from_prefetch(const llama_tensor_weight & weight) {
+            ranges[weight.idx].emplace_back(weight.offs, weight.offs + ggml_nbytes(weight.tensor));
+        }
+
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 
@@ -114,6 +121,9 @@ struct llama_model_loader {
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    ggml_backend_buffer_type_t external_expert_buft = nullptr;
+    size_t external_expert_skipped_bytes = 0;
 
     llama_files files;
     llama_ftype ftype;

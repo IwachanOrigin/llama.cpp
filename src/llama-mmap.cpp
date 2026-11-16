@@ -673,6 +673,16 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+void llama_file::read_exact_at(size_t offset, void * ptr, size_t len) {
+    if (offset > size() || len > size() - offset) {
+        throw std::runtime_error("read range is outside the file");
+    }
+    seek(offset, SEEK_SET);
+    read_raw(ptr, len);
+    if (tell() != offset + len) {
+        throw std::runtime_error("short read");
+    }
+}
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }

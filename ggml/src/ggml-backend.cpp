@@ -1480,11 +1480,70 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static bool ggml_backend_sched_pin_external_experts(ggml_backend_sched_t sched, const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        const auto * leaf = graph->leafs[i];
+        if (ggml_external_expert_root(leaf->view_src) ||
+                ((leaf->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) && (leaf->flags & GGML_TENSOR_FLAG_INPUT))) {
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto * node = graph->nodes[i];
+        if (ggml_external_expert_root(node)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            auto * src = node->src[j];
+            const auto * root = ggml_external_expert_root(src);
+            if (!root) {
+                continue;
+            }
+            if (src != root || j != 0 || node->op != GGML_OP_MUL_MAT_ID ||
+                    (src->flags & GGML_TENSOR_FLAG_INPUT) || !src->buffer) {
+                return false;
+            }
+            auto * device = ggml_backend_buft_get_device(src->buffer->buft);
+            if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return false;
+            }
+            int backend_id = -1;
+            for (int b = 0; b < sched->n_backends; ++b) {
+                auto * backend = sched->backends[b];
+                if (ggml_backend_get_device(backend) == device && ggml_backend_supports_buft(backend, src->buffer->buft) &&
+                        ggml_backend_supports_op(backend, node) &&
+                        (!node->buffer || ggml_backend_supports_buft(backend, node->buffer->buft))) {
+                    backend_id = b;
+                    break;
+                }
+            }
+            int & src_id = tensor_backend_id(src);
+            int & node_id = tensor_backend_id(node);
+            if (backend_id < 0 || (src_id >= 0 && src_id != backend_id) || (node_id >= 0 && node_id != backend_id)) {
+                return false;
+            }
+            src_id = node_id = backend_id;
+        }
+    }
+    return true;
+}
+
+static void ggml_backend_sched_reset_failed_graph(ggml_backend_sched_t sched) {
+    sched->n_splits = 0;
+    sched->n_graph_inputs = 0;
+    ggml_backend_sched_reset(sched);
+}
+
+bool ggml_backend_sched_try_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    sched->is_reset = false;
+    if (!ggml_backend_sched_pin_external_experts(sched, graph)) {
+        GGML_LOG_ERROR("%s: invalid external Expert operation or placement\n", __func__);
+        ggml_backend_sched_reset_failed_graph(sched);
+        return false;
+    }
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
-    sched->is_reset = false;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -2027,6 +2086,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    return true;
+}
+
+void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (!ggml_backend_sched_try_split_graph(sched, graph)) {
+        GGML_ABORT("failed to split backend graph");
+    }
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -2416,7 +2482,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
-void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+bool ggml_backend_sched_try_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
@@ -2425,9 +2491,17 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
-
+    if (!ggml_backend_sched_try_split_graph(sched, measure_graph)) {
+        return false;
+    }
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    return true;
+}
+
+void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+    if (!ggml_backend_sched_try_reserve_size(sched, measure_graph, sizes)) {
+        GGML_ABORT("failed to measure backend graph");
+    }
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
@@ -2436,9 +2510,12 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    if (!ggml_backend_sched_try_split_graph(sched, measure_graph)) {
+        return false;
+    }
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+        ggml_backend_sched_reset_failed_graph(sched);
         return false;
     }
 
@@ -2452,14 +2529,19 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    const int prev_copy = sched->cur_copy;
     sched->cur_copy = sched->next_copy;
-    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
-
-    ggml_backend_sched_split_graph(sched, graph);
-
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    if (!ggml_backend_sched_try_split_graph(sched, graph)) {
+        sched->cur_copy = prev_copy;
         return false;
     }
+
+    if (!ggml_backend_sched_alloc_splits(sched)) {
+        sched->cur_copy = prev_copy;
+        ggml_backend_sched_reset_failed_graph(sched);
+        return false;
+    }
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
     sched->is_alloc = true;
 
