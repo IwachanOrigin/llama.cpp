@@ -3,6 +3,11 @@
 !snapshots/
 !fusion/
 !llama-context/
+!moe-paging/
+moe-paging/*
+!moe-paging/*.cpp
+!moe-paging/*.py
+!moe-paging/README.md
 *.o
 ggml-common.h
 **/*.swp

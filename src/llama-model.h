@@ -15,6 +15,7 @@
 #include <vector>
 
 struct llama_cparams;
+struct llama_pager_metrics;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
@@ -972,6 +973,8 @@ struct llama_model {
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
     int64_t t_load_us  = 0;
+    int64_t t_metadata_us = 0;
+    int64_t t_weights_us = 0;
     int64_t t_start_us = 0;
 
     explicit llama_model(const llama_model_params & params);
@@ -994,6 +997,8 @@ struct llama_model {
     bool no_alloc() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    llama_pager_metrics pager_metrics() const;
+    size_t pager_budget_for_slots(size_t slots) const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

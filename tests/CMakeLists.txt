@@ -366,6 +366,15 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
+if (GGML_CPU AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+    llama_build(moe-paging/bench-expert-paging.cpp LINK llama ggml Threads::Threads)
+    set_target_properties(bench-expert-paging PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+    target_include_directories(bench-expert-paging PRIVATE ../src)
+    if (WIN32)
+        target_link_libraries(bench-expert-paging PRIVATE psapi)
+    endif()
+endif()
+
 llama_build_and_test(test-expert-cache.cpp ../src/llama-expert-cache.cpp LINK ggml Threads::Threads LABEL behavior
     ARGS "${CMAKE_CURRENT_BINARY_DIR}/expert-cache-test")
 target_include_directories(test-expert-cache PRIVATE ../src)

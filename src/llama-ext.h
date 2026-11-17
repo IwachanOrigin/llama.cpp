@@ -116,6 +116,19 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+struct llama_pager_metrics {
+    uint64_t cache_hits, cache_misses, cache_evictions, disk_reads, bytes_read;
+    uint64_t io_wait_ns, cache_wait_ns, capacity_wait_ns, lease_wait_ns;
+    size_t pinned_slots, peak_allocated_bytes, slots, max_expert_bytes;
+};
+
+LLAMA_API llama_pager_metrics llama_get_pager_metrics(const llama_model * model);
+LLAMA_API size_t llama_pager_budget_for_slots(const llama_model * model, size_t slots);
+LLAMA_API size_t llama_get_model_buffer_bytes(const llama_model * model);
+LLAMA_API std::map<ggml_type, uint64_t> llama_model_tensor_type_bytes(const llama_model * model);
+LLAMA_API int64_t llama_model_metadata_load_us(const llama_model * model);
+LLAMA_API int64_t llama_model_weights_load_us(const llama_model * model);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

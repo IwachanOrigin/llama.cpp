@@ -1538,12 +1538,15 @@ struct llama_external_experts {
         for (const auto & file : shards) {
             account(overhead, 1, file->retained_bytes());
         }
+        max_expert_bytes = max_slice;
+        lru_overhead = overhead;
+        account(lru_overhead, 1, sizeof(lru_state));
+        account(lru_overhead, shards.size(), sizeof(std::mutex));
 
         size_t cache_budget = 0;
         planned_bytes = overhead;
         if (budget) {
-            account(overhead, 1, sizeof(lru_state));
-            account(overhead, shards.size(), sizeof(std::mutex));
+            overhead = lru_overhead;
             if (overhead >= budget || budget - overhead < llama_expert_cache::required_bytes(max_slice, 1)) {
                 throw std::runtime_error("external Expert cache budget does not fit one slot and provider metadata");
             }
@@ -1594,6 +1597,8 @@ struct llama_external_experts {
     size_t planned_bytes = 0;
     size_t allocated_bytes = 0;
     size_t slots = 1;
+    size_t max_expert_bytes = 0;
+    size_t lru_overhead = 0;
     llama_expert_cache::statistics legacy;
     std::vector<uint8_t> slot;
     std::unique_ptr<tensor_source[]> sources;
@@ -2882,6 +2887,57 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+llama_pager_metrics llama_model::pager_metrics() const {
+    if (!pimpl->external_experts) {
+        return {};
+    }
+    auto & pager = *pimpl->external_experts;
+    llama_expert_cache::statistics stats{};
+    uint64_t lease_wait = 0;
+    if (pager.lru) {
+        stats = pager.lru->cache->stats();
+        std::lock_guard<std::mutex> lock(pager.lru->lease_mutex);
+        lease_wait = pager.lru->lease_wait_ns;
+    } else {
+        std::lock_guard<std::mutex> lock(pager.mutex);
+        stats = pager.legacy;
+    }
+    return {stats.cache_hits, stats.cache_misses, stats.cache_evictions, stats.disk_reads, stats.bytes_read,
+        stats.io_wait_ns, stats.cache_wait_ns + lease_wait, stats.capacity_wait_ns, lease_wait,
+        stats.pinned_slots, no_alloc() ? pager.planned_bytes : pager.allocated_bytes, pager.slots, pager.max_expert_bytes};
+}
+
+size_t llama_model::pager_budget_for_slots(size_t slots) const {
+    if (!pimpl->external_experts || !slots) {
+        return 0;
+    }
+    auto & pager = *pimpl->external_experts;
+    size_t total = pager.lru_overhead;
+    llama_external_experts::account(total, 1, llama_expert_cache::required_bytes(pager.max_expert_bytes, slots));
+    return total;
+}
+
+llama_pager_metrics llama_get_pager_metrics(const llama_model * model) { return model->pager_metrics(); }
+size_t llama_pager_budget_for_slots(const llama_model * model, size_t slots) { return model->pager_budget_for_slots(slots); }
+int64_t llama_model_metadata_load_us(const llama_model * model) { return model->t_metadata_us; }
+int64_t llama_model_weights_load_us(const llama_model * model) { return model->t_weights_us; }
+
+size_t llama_get_model_buffer_bytes(const llama_model * model) {
+    size_t total = 0;
+    for (const auto & entry : model->memory_breakdown()) {
+        total += entry.second;
+    }
+    return total;
+}
+
+std::map<ggml_type, uint64_t> llama_model_tensor_type_bytes(const llama_model * model) {
+    std::map<ggml_type, uint64_t> total;
+    for (const auto & entry : model->tensors_by_name) {
+        total[entry.second->type] += ggml_nbytes(entry.second);
+    }
+    return total;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

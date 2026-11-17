@@ -132,3 +132,91 @@ reports eight-run medians. Cache
 counters cover prefill and decode. `disk_reads` denotes reader calls, not
 physical storage operations. The LRU capacity timer counts waits for a slot;
 the single-slot timing measures acquisition of the slot mutex.
+
+## Phase 1B-4A real-model measurements
+
+Build the CPU benchmark and provide a local Qwen3MoE GGUF. For a split model,
+pass the first shard. The benchmark reads local paths and uses zero GPU layers.
+
+```sh
+cmake --build build --config Release --target bench-expert-paging
+python tests/moe-paging/bench-matrix.py --bench build/bin/bench-expert-paging --model /path/to/model.gguf \
+  --output measurements.json --threads 4 --ctx 512 --batch 128 --ubatch 64 --prefill 128 --decode 32
+```
+
+Append `.exe` to the executable path on Windows. The matrix defaults to Pager
+off, uncached single slot, and 1/16/64/128/256 LRU slots, with separate runs for
+one and two contexts. `--modes`, `--contexts`, `--io mmap|buffered`, and
+`--repeats` select other matrices. Before running each case, it uses
+`no_alloc` and the model's exact slot-sizing function. The runner skips
+cases whose separate ordinary-weight, Pager, KV, scheduler workspace, logits
+and headroom allowances exceed available physical memory or an optional lower
+`--max-planned-mib` ceiling. `--headroom-mib` defaults to 1024. Each execution
+checks currently available RAM again before loading. The mmap estimate counts
+all ordinary weights as a conservative allowance. External Expert weights are
+represented only by Pager capacity. The total GGUF file size, model backend
+buffer sizes (which can be address spans under mmap), and measured residency
+are reported separately. The estimate is a preflight check, not an OS memory
+reservation. Compare measured residency against the allowance on the target
+host before scaling up. Cases record `ok`, `skipped`, `error`, `timeout` or
+`mismatch`. Missing Pager-off comparisons are marked separately.
+
+For a specific byte budget or a standalone estimate:
+
+```sh
+build/bin/bench-expert-paging --model /path/to/model.gguf --output plan.json --pager lru --slots 64 --plan
+build/bin/bench-expert-paging --model /path/to/model.gguf --output sample.json --pager lru --budget 1GiB --io mmap
+```
+
+The matrix writes individual runs, medians, preflight decisions, and
+correctness results. Timings use fresh processes and alternate the case order
+every round. The default `warm` mode runs an untimed process for each case.
+`--warmup N` additionally runs N prefill/decode workloads inside each process,
+then clears KV while keeping the Pager cache. `--cache-state operator-cold`
+accepts one case with one repeat and no in-process warmup. It labels an
+operator-prepared cold run; metadata preflight still reads the GGUF headers.
+The tooling leaves OS caches under the operator's control.
+
+The prefill input repeats token IDs 1, 19, 7, 42, 51, 33, 91, 3 reduced
+modulo vocabulary size. Decode feeds fixed single tokens, one per step.
+Timed prefill requests one logits row per batch. Separate correctness runs
+validate all logits for finiteness and compare Expert IDs and FP32 logits
+to Pager off per context. Relative error uses max(abs(reference), 1e-30)
+as its denominator. Compare traces only within the same matrix and binary.
+`--no-verify` omits the correctness runs.
+
+### Interpreting the JSON
+
+- Metadata time covers GGUF headers, device setup, hyperparameters and vocabulary.
+  Weight time covers tensor setup and loading. Deferred mmap faults during
+  inference contribute to inference time. Context initialization is timed separately.
+- Throughput is aggregate tokens divided by wall time across the requested contexts.
+  `--sample-decode-memory` enables a separate memory-oriented run with a
+  resident-memory query per decode step. Its decode wall time includes those
+  queries. The default timing run samples only at phase boundaries, and
+  individual results also include per-context compute times.
+- Windows resident and lifetime peak metrics are Working Set and Peak Working Set.
+  Linux uses VmRSS and VmHWM from `/proc/self/status`. The decode-only sampled peak
+  is the highest token-boundary reading. The lifetime peak may include earlier
+  phases. Resident mapped pages can count toward process residency; the full
+  virtual size of mappings and system file cache are separate measurements.
+- Model, KV and scheduler compute buffer capacities describe allocated buffers.
+  CPU backend-private scratch is captured in process memory. Expert slot payload
+  excludes alignment and metadata; Pager peak includes managed overhead.
+- Prefill and decode Pager statistics are deltas after warmup. Pinned slots is an
+  end-of-phase sample. `disk_reads` counts reader invocations. Windows process
+  I/O counters track read requests and transferred bytes. Linux `/proc/self/io`
+  separates interface traffic from bytes attributed to storage by the kernel.
+  Process I/O can include unrelated reads, such as procfs sampling.
+- `cache_wait_ns` already includes the capacity and lease-record wait
+  counters. These are accumulated request times and can overlap across
+  contexts. Keep them separate from wall time and do not add the breakdowns
+  to the aggregate. On Windows, the host and executable architectures are
+  recorded separately. Translation is inferred from IsWow64Process2 and the
+  executable target (x86-64 running on ARM64 requires translation).
+
+For Linux sanitizer runs, configure separate builds with both
+`LLAMA_SANITIZE_ADDRESS` and `GGML_SANITIZE_ADDRESS` enabled, optionally
+combining with `LLAMA_SANITIZE_UNDEFINED` and `GGML_SANITIZE_UNDEFINED`.
+Configure a separate build with `LLAMA_SANITIZE_THREAD` and `GGML_SANITIZE_THREAD`
+(and `GGML_OPENMP=OFF` if needed). Run the five paging CTests in each build.

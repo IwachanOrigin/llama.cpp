@@ -329,6 +329,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (params.external_experts && (fname.empty() || file || metadata || params.vocab_only)) {
             throw std::runtime_error("external experts require a named GGUF model");
         }
+        const int64_t metadata_start = ggml_time_us();
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
@@ -372,12 +373,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         model->load_stats(ml);
         model->print_info();
+        model->t_metadata_us = ggml_time_us() - metadata_start;
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
             return {0, model_ptr.release()};
         }
 
+        time_meas weights_time(model->t_weights_us);
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
