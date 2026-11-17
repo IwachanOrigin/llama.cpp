@@ -340,6 +340,7 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
         bool external_experts;          // experimental, synchronous GGUF expert reads on CPU
+        size_t external_expert_cache_size; // byte budget for the model's LRU pager, 0 uses one uncached slot
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

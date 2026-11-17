@@ -323,6 +323,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        if (params.external_expert_cache_size && !params.external_experts) {
+            throw std::runtime_error("external Expert cache requires external_experts");
+        }
         if (params.external_experts && (fname.empty() || file || metadata || params.vocab_only)) {
             throw std::runtime_error("external experts require a named GGUF model");
         }

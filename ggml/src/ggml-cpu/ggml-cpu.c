@@ -1779,7 +1779,7 @@ static void ggml_compute_forward_mul_mat_id(
         if (external) {
             ggml_barrier(params->threadpool);
             if (ith == 0) {
-                external->release(external->context, lease.token);
+                external->release(external->context, lease);
                 params->threadpool->external_expert_data = NULL;
             }
         }

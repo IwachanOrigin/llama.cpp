@@ -22,6 +22,7 @@ public:
         uint64_t bytes_read = 0;
         uint64_t io_wait_ns = 0;
         uint64_t cache_wait_ns = 0;
+        uint64_t capacity_wait_ns = 0;
         size_t pinned_slots = 0;
         size_t peak_allocated_bytes = 0;
         size_t waiting_requests = 0;
@@ -62,6 +63,7 @@ public:
     llama_expert_cache & operator=(const llama_expert_cache &) = delete;
 
     static size_t required_bytes(size_t max_expert_bytes, size_t slot_count);
+    static size_t capacity_for_budget(size_t budget, size_t max_expert_bytes);
     size_t capacity() const { return slot_count; }
     lease acquire(key expert, size_t bytes);
     statistics stats() const;

@@ -683,6 +683,9 @@ void llama_file::read_exact_at(size_t offset, void * ptr, size_t len) {
         throw std::runtime_error("short read");
     }
 }
+size_t llama_file::retained_bytes() const {
+    return sizeof(*this) + sizeof(impl) + pimpl->fname.capacity() + 1;
+}
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }

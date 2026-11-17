@@ -731,7 +731,7 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_cpu_device_get_extra_buffers_type;
         return (void *)fct;
     }
-    if (strcmp(name, "ggml_cpu_external_expert_buffer_create") == 0) {
+    if (strcmp(name, "ggml_cpu_external_expert_buffer_create_v2") == 0) {
         return (void *)ggml_cpu_external_expert_buffer_create;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {

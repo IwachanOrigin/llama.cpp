@@ -4,6 +4,7 @@
 #include <chrono>
 #include <new>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -54,13 +55,12 @@ size_t llama_expert_cache::required_bytes(size_t max_expert_bytes, size_t count)
     return sizeof(llama_expert_cache) + metadata + count * stride;
 }
 
-llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, read_fn reader, void * reader_context) :
-    reader(reader), reader_context(reader_context), max_expert_bytes(max_expert_bytes) {
-    if (!reader || budget < required_bytes(max_expert_bytes, 1)) {
+size_t llama_expert_cache::capacity_for_budget(size_t budget, size_t max_expert_bytes) {
+    if (budget < required_bytes(max_expert_bytes, 1)) {
         throw std::invalid_argument("expert cache budget must fit at least one slot and its metadata");
     }
     const size_t stride = aligned_size(max_expert_bytes);
-    const size_t available = budget - sizeof(*this);
+    const size_t available = budget - sizeof(llama_expert_cache);
     size_t lower = 1;
     size_t upper = available / stride;
     while (lower < upper) {
@@ -73,10 +73,21 @@ llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, r
             upper = count - 1;
         }
     }
-    slot_count = lower;
+    return lower;
+}
+
+llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, read_fn reader, void * reader_context) :
+    reader(reader), reader_context(reader_context), max_expert_bytes(max_expert_bytes) {
+    if (!reader) {
+        throw std::invalid_argument("expert cache needs a reader");
+    }
+    slot_count = capacity_for_budget(budget, max_expert_bytes);
+    const size_t stride = aligned_size(max_expert_bytes);
     static_assert(alignof(slot) <= slot_alignment, "slot metadata must fit in the aligned allocation");
+    static_assert(std::is_trivially_destructible<slot>::value, "slot destruction must not require a loop");
     counters.peak_allocated_bytes = required_bytes(max_expert_bytes, slot_count);
     allocation = ::operator new(counters.peak_allocated_bytes - sizeof(*this), std::align_val_t(slot_alignment));
+    // The standard non-allocating placement array form has zero overhead (CWG 2382).
     slots = ::new (allocation) slot[slot_count]();
     auto * data = static_cast<unsigned char *>(allocation) + aligned_size(slot_count * sizeof(slot));
     for (size_t i = 0; i < slot_count; ++i) {
@@ -184,12 +195,16 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
         return {};
     }
     std::unique_lock<std::mutex> lock(mutex);
-    const auto wait = [&] {
+    const auto wait = [&](bool for_capacity) {
         const auto start = cache_clock::now();
         ++counters.waiting_requests;
         changed.wait(lock);
         --counters.waiting_requests;
-        counters.cache_wait_ns += elapsed_ns(start);
+        const auto duration = elapsed_ns(start);
+        counters.cache_wait_ns += duration;
+        if (for_capacity) {
+            counters.capacity_wait_ns += duration;
+        }
     };
 
     slot * selected = nullptr;
@@ -212,7 +227,7 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
             if (current.status == slot::state::loading) {
                 ++current.waiters;
                 do {
-                    wait();
+                    wait(false);
                 } while (current.status == slot::state::loading);
                 --current.waiters;
                 if (current.status == slot::state::failed && !current.waiters) {
@@ -244,7 +259,7 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
         if (selected) {
             break;
         }
-        wait();
+        wait(true);
     }
 
     selected->expert = expert;

@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-ext.h"
+#include "llama-expert-cache.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -24,10 +25,13 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/external-expert.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cassert>
 #include <cfloat>
 #include <cinttypes>
@@ -1359,8 +1363,77 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 }
 
 struct llama_external_experts {
+    using clock = std::chrono::steady_clock;
+
+    struct lru_state {
+        struct lease_record {
+            llama_expert_cache::lease pin;
+            uint64_t generation = 0;
+            bool busy = false;
+            bool releasing = false;
+        };
+
+        std::unique_ptr<std::mutex[]> shard_mutexes;
+        std::unique_ptr<llama_expert_cache> cache;
+        std::mutex lease_mutex;
+        std::condition_variable lease_available;
+        std::array<lease_record, 64> leases;
+        uint64_t lease_wait_ns = 0;
+
+        lease_record & reserve_lease() {
+            std::unique_lock<std::mutex> lock(lease_mutex);
+            auto find_free = [&] {
+                return std::find_if(leases.begin(), leases.end(), [](const lease_record & record) { return !record.busy; });
+            };
+            auto record = find_free();
+            if (record == leases.end()) {
+                const auto start = clock::now();
+                lease_available.wait(lock, [&] { return (record = find_free()) != leases.end(); });
+                lease_wait_ns += elapsed_ns(start);
+            }
+            record->busy = true;
+            ++record->generation;
+            return *record;
+        }
+
+        void release_lease(lease_record & record, uint64_t generation) noexcept {
+            llama_expert_cache::lease pin;
+            {
+                std::lock_guard<std::mutex> lock(lease_mutex);
+                GGML_ASSERT(record.busy && !record.releasing && record.generation == generation);
+                record.releasing = true;
+                pin = std::move(record.pin);
+            }
+            pin.reset();
+            {
+                std::lock_guard<std::mutex> lock(lease_mutex);
+                record.releasing = false;
+                record.busy = false;
+            }
+            lease_available.notify_one();
+        }
+
+        ggml_cpu_external_expert_lease acquire(llama_expert_cache::key key, size_t bytes) {
+            auto & record = reserve_lease();
+            auto pin = llama_expert_cache::lease{};
+            try {
+                pin = cache->acquire(key, bytes);
+            } catch (...) {
+                release_lease(record, record.generation);
+                throw;
+            }
+            if (!pin) {
+                release_lease(record, record.generation);
+                return {};
+            }
+            record.pin = std::move(pin);
+            return { record.pin.data(), &record, record.generation };
+        }
+    };
+
     struct tensor_source {
         llama_external_experts * owner;
+        uint64_t id;
         uint16_t shard;
         size_t offset;
         size_t stride;
@@ -1368,41 +1441,163 @@ struct llama_external_experts {
         ggml_type type;
         ggml_cpu_external_expert_source provider{ this, acquire, release };
 
+        bool valid(int64_t expert, size_t bytes) const {
+            return expert >= 0 && expert < count && bytes == stride &&
+                static_cast<uint64_t>(expert) <= (SIZE_MAX - offset) / stride;
+        }
+
+        void read(int64_t expert, void * dst, size_t bytes) const {
+            owner->files.at(shard)->read_exact_at(offset + static_cast<size_t>(expert) * stride, dst, bytes);
+        }
+
+        void log_error(int64_t expert, const char * message) const {
+            LLAMA_LOG_ERROR("external Expert read failed: shard=%u offset=%zu expert=%" PRId64 " type=%s: %s\n",
+                unsigned(shard), offset, expert, ggml_type_name(type), message);
+        }
+
         static ggml_cpu_external_expert_lease acquire(void * context, int64_t expert, size_t bytes) noexcept {
             auto & source = *static_cast<tensor_source *>(context);
             auto & owner = *source.owner;
-            if (expert < 0 || expert >= source.count || bytes != source.stride || bytes > owner.slot.size()) {
+            if (!source.valid(expert, bytes)) {
                 return {};
             }
             try {
+                if (owner.lru) {
+                    return owner.lru->acquire({source.id, expert}, bytes);
+                }
+                if (bytes > owner.slot.size()) {
+                    return {};
+                }
+                const auto start = clock::now();
                 std::unique_lock<std::mutex> lock(owner.mutex);
-                owner.files.at(source.shard)->read_exact_at(source.offset + expert * source.stride, owner.slot.data(), bytes);
-                owner.bytes_read += bytes;
-                lock.release(); // The execution team releases the slot with this token.
-                return { owner.slot.data(), &owner };
+                const auto wait_ns = elapsed_ns(start);
+                owner.legacy.cache_wait_ns += wait_ns;
+                owner.legacy.capacity_wait_ns += wait_ns;
+                ++owner.legacy.cache_misses;
+                ++owner.legacy.disk_reads;
+                const auto read_start = clock::now();
+                source.read(expert, owner.slot.data(), bytes);
+                owner.legacy.io_wait_ns += elapsed_ns(read_start);
+                owner.legacy.bytes_read += bytes;
+                lock.release();
+                return { owner.slot.data(), &owner, 0 };
             } catch (const std::exception & e) {
-                LLAMA_LOG_ERROR("external Expert read failed: shard=%u offset=%zu expert=%" PRId64 " type=%s: %s\n",
-                    unsigned(source.shard), source.offset, expert, ggml_type_name(source.type), e.what());
+                source.log_error(expert, e.what());
                 return {};
             } catch (...) {
                 return {};
             }
         }
 
-        static void release(void * context, void * token) noexcept {
-            auto & source = *static_cast<tensor_source *>(context);
-            GGML_ASSERT(token == source.owner);
-            source.owner->mutex.unlock();
+        static void release(void * context, ggml_cpu_external_expert_lease lease) noexcept {
+            auto & owner = *static_cast<tensor_source *>(context)->owner;
+            if (owner.lru) {
+                owner.lru->release_lease(*static_cast<lru_state::lease_record *>(lease.token), lease.generation);
+            } else {
+                GGML_ASSERT(lease.token == &owner);
+                owner.mutex.unlock();
+            }
         }
     };
+
+    static uint64_t elapsed_ns(clock::time_point start) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+    }
+
+    static bool read_expert(void * context, llama_expert_cache::key key, void * dst, size_t bytes) {
+        auto & owner = *static_cast<llama_external_experts *>(context);
+        if (key.tensor_source_id >= owner.source_count) {
+            return false;
+        }
+        const auto & source = owner.sources[key.tensor_source_id];
+        if (!source.valid(key.expert_id, bytes) || source.shard >= owner.files.size()) {
+            return false;
+        }
+        try {
+            std::lock_guard<std::mutex> lock(owner.lru->shard_mutexes[source.shard]);
+            source.read(key.expert_id, dst, bytes);
+            return true;
+        } catch (const std::exception & e) {
+            source.log_error(key.expert_id, e.what());
+            return false;
+        }
+    }
+
+    static void account(size_t & total, size_t count, size_t size) {
+        if (count && size > (SIZE_MAX - total) / count) {
+            throw std::runtime_error("external Expert pager memory size overflow");
+        }
+        total += count * size;
+    }
+
+    void prepare(size_t budget, size_t max_slice, size_t count, const llama_files & shards, bool no_alloc) {
+        size_t overhead = sizeof(*this);
+        account(overhead, 1, sizeof(ggml_backend_buffer));
+        account(overhead, count, sizeof(tensor_source));
+        account(overhead, shards.capacity(), sizeof(llama_files::value_type));
+        for (const auto & file : shards) {
+            account(overhead, 1, file->retained_bytes());
+        }
+
+        size_t cache_budget = 0;
+        planned_bytes = overhead;
+        if (budget) {
+            account(overhead, 1, sizeof(lru_state));
+            account(overhead, shards.size(), sizeof(std::mutex));
+            if (overhead >= budget || budget - overhead < llama_expert_cache::required_bytes(max_slice, 1)) {
+                throw std::runtime_error("external Expert cache budget does not fit one slot and provider metadata");
+            }
+            cache_budget = budget - overhead;
+            slots = llama_expert_cache::capacity_for_budget(cache_budget, max_slice);
+            planned_bytes = overhead + llama_expert_cache::required_bytes(max_slice, slots);
+        } else {
+            account(planned_bytes, 1, max_slice);
+        }
+
+        source_count = count;
+        sources = std::make_unique<tensor_source[]>(count);
+        if (!no_alloc) {
+            if (budget) {
+                lru = std::make_unique<lru_state>();
+                lru->shard_mutexes = std::make_unique<std::mutex[]>(shards.size());
+                lru->cache = std::make_unique<llama_expert_cache>(cache_budget, max_slice, read_expert, this);
+                allocated_bytes = overhead + lru->cache->stats().peak_allocated_bytes;
+            } else {
+                slot.resize(max_slice);
+                allocated_bytes = overhead + slot.capacity();
+            }
+        }
+        LLAMA_LOG_INFO("external Expert pager: mode=%s slots=%zu budget_bytes=%zu peak_allocated_bytes=%zu\n",
+            budget ? "lru" : "single", slots, budget, allocated_bytes);
+    }
+
+    ~llama_external_experts() {
+        if (files.empty()) {
+            return;
+        }
+        auto stats = lru ? lru->cache->stats() : legacy;
+        if (lru) {
+            stats.cache_wait_ns += lru->lease_wait_ns;
+        }
+        LLAMA_LOG_INFO("external Expert stats: cache_hits=%" PRIu64 " cache_misses=%" PRIu64
+            " cache_evictions=%" PRIu64 " disk_reads=%" PRIu64 " bytes_read=%" PRIu64
+            " io_wait_ns=%" PRIu64 " cache_wait_ns=%" PRIu64 " capacity_wait_ns=%" PRIu64
+            " lease_wait_ns=%" PRIu64 " peak_allocated_bytes=%zu\n",
+            stats.cache_hits, stats.cache_misses, stats.cache_evictions, stats.disk_reads, stats.bytes_read,
+            stats.io_wait_ns, stats.cache_wait_ns, stats.capacity_wait_ns, lru ? lru->lease_wait_ns : 0, allocated_bytes);
+    }
 
     std::mutex mutex;
     llama_files files;
     ggml_backend_buffer_type_t buft = nullptr;
-    size_t planned_slot_bytes = 0;
-    uint64_t bytes_read = 0;
+    size_t source_count = 0;
+    size_t planned_bytes = 0;
+    size_t allocated_bytes = 0;
+    size_t slots = 1;
+    llama_expert_cache::statistics legacy;
     std::vector<uint8_t> slot;
-    std::vector<std::unique_ptr<tensor_source>> sources;
+    std::unique_ptr<tensor_source[]> sources;
+    std::unique_ptr<lru_state> lru;
 };
 
 struct llama_model::impl {
@@ -1801,11 +1996,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ggml_backend_buffer_ptr external_buffer;
     if (params.external_experts) {
+        if (params.external_expert_cache_size &&
+                params.external_expert_cache_size < sizeof(llama_external_experts) + sizeof(ggml_backend_buffer)) {
+            throw std::runtime_error("external Expert cache budget does not fit one slot and provider metadata");
+        }
         if (arch != LLM_ARCH_QWEN3MOE || params.check_tensors || use_mlock || ml.use_direct_io || has_tensor_overrides()) {
             throw std::runtime_error("external experts require Qwen3MoE, buffered I/O or mmap, and no tensor validation or overrides");
         }
         auto * create = (decltype(ggml_cpu_external_expert_buffer_create) *) ggml_backend_reg_get_proc_address(
-            ggml_backend_dev_backend_reg(cpu_dev), "ggml_cpu_external_expert_buffer_create");
+            ggml_backend_dev_backend_reg(cpu_dev), "ggml_cpu_external_expert_buffer_create_v2");
         if (!create) {
             throw std::runtime_error("CPU backend does not support external experts");
         }
@@ -2110,35 +2309,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             auto & external = *pimpl->external_experts;
             size_t slot_bytes = 0;
             size_t logical_bytes = 0;
+            size_t source_count = 0;
             for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
                 const auto & weight = ml.require_weight(t->name);
                 const size_t bytes = ggml_nbytes(t);
                 if (!(t->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) || t->data || t->view_src ||
                         !ggml_is_contiguous(t) || t->ne[2] <= 0 || t->ne[3] != 1 ||
                         !t->nb[2] || bytes % t->nb[2] || bytes / t->nb[2] != (size_t)t->ne[2] ||
-                        bytes > SIZE_MAX - logical_bytes) {
+                        bytes > SIZE_MAX - logical_bytes || weight.idx >= ml.files.size() ||
+                        weight.offs > ml.files[weight.idx]->size() || bytes > ml.files[weight.idx]->size() - weight.offs) {
                     throw std::runtime_error(format("invalid external Expert layout for '%s'", t->name));
                 }
-                auto source = std::make_unique<llama_external_experts::tensor_source>();
-                source->owner = &external;
-                source->shard = weight.idx;
-                source->offset = weight.offs;
-                source->stride = t->nb[2];
-                source->count = t->ne[2];
-                source->type = t->type;
-                t->buffer = external_buffer.get();
-                t->extra = &source->provider;
-                external.sources.push_back(std::move(source));
                 slot_bytes = std::max(slot_bytes, t->nb[2]);
                 logical_bytes += bytes;
+                ++source_count;
             }
-            if (!ml.no_alloc) {
-                external.slot.resize(slot_bytes);
+            external.prepare(params.external_expert_cache_size, slot_bytes, source_count, ml.files, ml.no_alloc);
+            size_t source_id = 0;
+            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                const auto & weight = ml.require_weight(t->name);
+                auto & source = external.sources[source_id];
+                source.owner = &external;
+                source.id = source_id++;
+                source.shard = weight.idx;
+                source.offset = weight.offs;
+                source.stride = t->nb[2];
+                source.count = t->ne[2];
+                source.type = t->type;
+                t->buffer = external_buffer.get();
+                t->extra = &source.provider;
             }
-            external.planned_slot_bytes = slot_bytes;
             const size_t buffer_bytes = ggml_backend_buffer_get_size(external_buffer.get());
             LLAMA_LOG_INFO("external experts: tensors=%zu logical_bytes=%zu buffer_bytes=%zu slot_bytes=%zu\n",
-                external.sources.size(), logical_bytes, buffer_bytes, external.slot.capacity());
+                external.source_count, logical_bytes, buffer_bytes, ml.no_alloc ? 0 : slot_bytes);
             ctx_bufs.emplace_back(ctx, std::vector<ggml_backend_buffer_t>{ external_buffer.get() });
             std::vector<ggml_backend_buffer_ptr> bufs;
             bufs.emplace_back(std::move(external_buffer));
@@ -2288,7 +2491,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         auto & external = *pimpl->external_experts;
         external.files = std::move(ml.files);
         LLAMA_LOG_INFO("external experts: shards=%zu skipped_bytes=%zu initial_read_bytes=%" PRIu64 "\n",
-            external.files.size(), ml.external_expert_skipped_bytes, external.bytes_read);
+            external.files.size(), ml.external_expert_skipped_bytes, external.legacy.bytes_read);
     }
 
     return true;
@@ -2687,7 +2890,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         if (pimpl->external_experts && !bufs.empty() &&
                 ggml_backend_buffer_get_type(bufs.front().get()) == pimpl->external_experts->buft) {
             const auto & external = *pimpl->external_experts;
-            ret[external.buft] += no_alloc() ? external.planned_slot_bytes : external.slot.capacity();
+            ret[external.buft] += no_alloc() ? external.planned_bytes : external.allocated_bytes;
             continue;
         }
         if (no_alloc()) {
@@ -3690,6 +3893,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.external_experts            =*/ false,
+        /*.external_expert_cache_size  =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

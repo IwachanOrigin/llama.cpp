@@ -88,7 +88,47 @@ is a hit. I/O time measures reader wall time (including a shard-lock wait),
 and cache wait time measures condition-variable waits. Both timers aggregate
 across threads.
 
-Phase 1B-3B can give each model one shared cache, assign stable IDs to its
-registered tensor sources, and use a shard-locked reader for
-`llama_file::read_exact_at()`. The current model loader and single-slot CPU
-provider still use the Phase 1B-2A path.
+## Qwen3MoE LRU integration
+
+For a named CPU Qwen3MoE GGUF, enable `external_experts` and provide a nonzero
+`llama_model_params.external_expert_cache_size` in bytes. A zero budget selects
+the original uncached single slot. The loader assigns source IDs in Expert
+tensor creation order and owns one cache and one set of shard handles per model.
+
+The total budget accounts for the cache allocation, source records, the
+zero-byte GGML buffer descriptor, the retained file wrappers and filename
+capacity, per-shard mutexes, and the bounded pool of 64 provider lease records.
+The reader writes directly into each reserved slot. Runtime allocator and
+stdio bookkeeping, OS file cache, and normal GGML model and graph storage are
+outside this accounting.
+
+The CPU team receives a provider record pointer and generation. Each record
+owns one move-only cache lease. The team leader passes the same token back
+after all workers finish reading. In LRU mode, record admission, cache
+operations, and shard I/O use separate mutexes; the record mutex is released
+before the cache is entered, and the cache mutex is released before taking a
+shard mutex. Release drops the cache pin before making the record reusable,
+without nesting those mutexes. Idle records are reused without per-request
+heap allocation. The test holds all 64 records on one Expert, then checks
+that the next request waits and resumes with a new record generation.
+
+`test-qwen3moe-lru` checks one, two and four slots, one and four CPU threads,
+single and split GGUF, mmap and buffered loading, and two simultaneous
+contexts. It also exercises the actual model provider and temporarily truncates
+a buffered fixture to check read failure and recovery.
+
+To time the uninstrumented graph with the same decoder inputs:
+
+```sh
+python tests/moe-paging/run.py build/bin/test-qwen3moe-lazy build/bin/llama-gguf-split bench
+```
+
+The benchmark sweeps 1, 2, 4, 8, 16, 32 and 64 slots using the exact budget
+reported by the loader for each capacity. A separate traced run computes
+reuse distance as the number of distinct Expert keys since the last use,
+then checks the first-hit boundary against the measured counters. Tracing
+is disabled for the timed runs. The benchmark alternates run order and
+reports eight-run medians. Cache
+counters cover prefill and decode. `disk_reads` denotes reader calls, not
+physical storage operations. The LRU capacity timer counts waits for a slot;
+the single-slot timing measures acquisition of the slot mutex.

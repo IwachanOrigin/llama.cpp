@@ -59,12 +59,12 @@ struct expert_source {
             source.held = false;
             return {};
         }
-        return { source.slice.data(), source.slice.data() };
+        return { source.slice.data(), source.slice.data(), 0 };
     }
 
-    static void release(void * context, void * token) {
+    static void release(void * context, ggml_cpu_external_expert_lease lease) {
         auto & source = *static_cast<expert_source *>(context);
-        GGML_ASSERT(source.held && token == source.slice.data());
+        GGML_ASSERT(source.held && lease.token == source.slice.data());
         source.held = false;
         ++source.releases;
     }
