@@ -5,6 +5,7 @@
 !llama-context/
 !moe-paging/
 moe-paging/*
+!moe-paging/measurements/
 !moe-paging/*.cpp
 !moe-paging/*.py
 !moe-paging/README.md
