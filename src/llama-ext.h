@@ -121,6 +121,10 @@ struct llama_pager_metrics {
     uint64_t io_wait_ns, cache_wait_ns, capacity_wait_ns, lease_wait_ns;
     size_t pinned_slots, peak_allocated_bytes, slots, max_expert_bytes;
 };
+using llama_pager_trace_fn = void (*)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept;
+// Call only while no contexts using this model are computing.
+LLAMA_API void llama_set_pager_trace(llama_model * model, llama_pager_trace_fn callback, void * context);
+LLAMA_API std::map<uint64_t, std::string> llama_pager_source_names(const llama_model * model);
 
 LLAMA_API llama_pager_metrics llama_get_pager_metrics(const llama_model * model);
 LLAMA_API size_t llama_pager_budget_for_slots(const llama_model * model, size_t slots);

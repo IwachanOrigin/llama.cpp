@@ -998,6 +998,8 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     llama_pager_metrics pager_metrics() const;
+    void set_pager_trace(void (*callback)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept, void * context);
+    std::map<uint64_t, std::string> pager_source_names() const;
     size_t pager_budget_for_slots(size_t slots) const;
 
     // total number of parameters in the model

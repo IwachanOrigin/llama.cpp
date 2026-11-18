@@ -242,6 +242,9 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
             auto result = pin(current);
             if (result) {
                 ++counters.cache_hits;
+                if (trace) {
+                    trace(trace_context, expert.tensor_source_id, expert.expert_id, bytes, true, i);
+                }
             }
             return result;
         }
@@ -268,6 +271,9 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
     ++selected->generation;
     ++counters.cache_misses;
     ++counters.disk_reads;
+    if (trace) {
+        trace(trace_context, expert.tensor_source_id, expert.expert_id, bytes, false, selected - slots);
+    }
     lock.unlock();
 
     const auto start = cache_clock::now();

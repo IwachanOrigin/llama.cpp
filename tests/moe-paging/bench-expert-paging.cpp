@@ -39,6 +39,8 @@ double ms(clock_type::time_point start) {
 
 struct options {
     std::string model, output, trace;
+    std::string access_trace;
+    size_t trace_limit = 1000000;
     std::string pager = "off", io = "mmap", cache_state = "uncontrolled";
     size_t budget = 0, slots = 0, required_available = 0;
     int threads = 4, context = 512, batch = 128, ubatch = 64, prefill = 128, decode = 32, contexts = 1, warmup = 0;
@@ -87,6 +89,8 @@ options parse(int argc, char ** argv) {
         if (key == "--model") o.model = value;
         else if (key == "--output") o.output = value;
         else if (key == "--trace-prefix") o.trace = value;
+        else if (key == "--expert-access-trace") o.access_trace = value;
+        else if (key == "--expert-trace-limit") o.trace_limit = number(value);
         else if (key == "--pager") o.pager = value;
         else if (key == "--io") o.io = value;
         else if (key == "--cache-state") o.cache_state = value;
@@ -115,7 +119,8 @@ options parse(int argc, char ** argv) {
             (o.io != "mmap" && o.io != "buffered") ||
             (o.pager != "off" && o.pager != "single" && o.pager != "lru") ||
             (o.pager == "lru" ? (!!o.budget == !!o.slots) : (o.budget || o.slots)) ||
-            (o.slots && !o.plan)) {
+            (o.slots && !o.plan) ||
+            (!o.access_trace.empty() && (o.plan || o.pager == "off" || o.warmup || !o.trace_limit))) {
         throw std::invalid_argument("invalid benchmark configuration; use --help");
     }
     return o;
@@ -328,7 +333,61 @@ void write_architecture(std::ostream & out) {
         << ",\"process_emulated\":" << translated;
 }
 
+struct access_trace {
+    struct event {
+        uint64_t source;
+        int64_t expert;
+        size_t bytes;
+        size_t slot;
+        bool decode;
+        bool hit;
+    };
+    std::vector<event> records;
+    size_t count = 0;
+    bool decode = false;
+
+    static void record(void * context, uint64_t source, int64_t expert, size_t bytes, bool hit, size_t slot) noexcept {
+        auto & trace = *static_cast<access_trace *>(context);
+        if (trace.count < trace.records.size()) {
+            trace.records[trace.count] = {source, expert, bytes, slot, trace.decode, hit};
+        }
+        ++trace.count;
+    }
+
+    void save(const options & o, const llama_pager_metrics & pager,
+              const std::map<uint64_t, std::string> & sources) const {
+        std::ofstream out(fs::u8path(o.access_trace));
+        out.exceptions(std::ios::badbit | std::ios::failbit);
+        const auto saved = std::min(count, records.size());
+        out << "{\"version\":1,\"contexts\":" << o.contexts << ",\"mode\":" << std::quoted(o.pager)
+            << ",\"slots\":" << pager.slots << ",\"max_expert_bytes\":" << pager.max_expert_bytes
+            << ",\"managed_bytes\":" << pager.peak_allocated_bytes << ",\"dropped\":" << count - saved
+            << ",\"events\":" << count << ",\"hits\":" << pager.cache_hits
+            << ",\"misses\":" << pager.cache_misses << ",\"evictions\":" << pager.cache_evictions
+            << ",\"reads\":" << pager.disk_reads << ",\"bytes_read\":" << pager.bytes_read
+            << ",\"sources\":{";
+        bool first = true;
+        for (const auto & [id, name] : sources) {
+            if (!first) out << ',';
+            first = false;
+            out << '"' << id << "\":" << std::quoted(name);
+        }
+        out << "}}\n";
+        for (size_t i = 0; i < saved; ++i) {
+            const auto & entry = records[i];
+            out << '[' << i << ',' << entry.source << ',' << entry.expert << ',' << entry.bytes
+                << ',' << entry.slot << ',' << entry.decode << ',' << entry.hit << "]\n";
+        }
+        out.close();
+    }
+};
+
 void benchmark(options o) {
+    if (!o.access_trace.empty() && (fs::exists(fs::u8path(o.access_trace)) ||
+            fs::absolute(fs::u8path(o.access_trace)).lexically_normal() ==
+            fs::absolute(fs::u8path(o.output)).lexically_normal())) {
+        throw std::invalid_argument("Expert trace must be a new file distinct from the benchmark output");
+    }
     if (fs::exists(fs::u8path(o.output)) && fs::equivalent(fs::u8path(o.output), fs::u8path(o.model))) {
         throw std::invalid_argument("output path refers to the model");
     }
@@ -356,6 +415,7 @@ void benchmark(options o) {
     }
     const auto before_load = memory();
     const auto before_load_io = io_counters();
+    access_trace accesses;
     auto start = clock_type::now();
     llama_model_ptr model(llama_model_load_from_file(o.model.c_str(), mp));
     const double load_ms = ms(start);
@@ -363,6 +423,13 @@ void benchmark(options o) {
     const auto after_load = memory();
     const auto after_load_io = io_counters();
     const auto pager = llama_get_pager_metrics(model.get());
+    std::map<uint64_t, std::string> trace_sources;
+    if (!o.access_trace.empty()) {
+        accesses.records.resize(o.trace_limit);
+        trace_sources = llama_pager_source_names(model.get());
+        if (trace_sources.empty()) throw std::runtime_error("model has no external Expert sources");
+        llama_set_pager_trace(model.get(), access_trace::record, &accesses);
+    }
     const size_t total_model = llama_get_model_buffer_bytes(model.get());
     // memory_breakdown includes the Pager's planned or allocated bytes exactly once.
     if (pager.peak_allocated_bytes > total_model) {
@@ -419,6 +486,7 @@ void benchmark(options o) {
         << ",\"vocab_size\":" << llama_vocab_n_tokens(llama_model_get_vocab(model.get()))
         << ",\"pager\":" << std::quoted(o.pager) << ",\"io\":" << std::quoted(o.io)
         << ",\"os_cache_state\":" << std::quoted(o.cache_state)
+        << ",\"expert_access_trace_enabled\":" << (!o.access_trace.empty() ? "true" : "false")
         << ",\"plan\":" << (o.plan ? "true" : "false")
 #ifdef _WIN32
         << ",\"memory_definition\":\"windows_working_set\""
@@ -501,6 +569,7 @@ void benchmark(options o) {
         const auto prefill_stats = llama_get_pager_metrics(model.get());
         const auto prefill_io = io_counters();
         for (auto & run : runs) run.decode_peak = prefill_end.resident;
+        accesses.decode = true;
         const double decode_ms = parallel(o.contexts, [&](int id) { decode(id, o.sample_decode_memory); });
         const auto decode_end = memory();
         const auto decode_stats = llama_get_pager_metrics(model.get());
@@ -541,11 +610,13 @@ void benchmark(options o) {
         write_io(out, "prefill_process_io", initial_io, prefill_io);
         write_io(out, "decode_process_io", prefill_io, decode_io);
     }
+    const auto final_pager = llama_get_pager_metrics(model.get());
     runs.clear();
     model.reset();
     llama_backend_free();
     write_memory(out, "after_free", memory());
     out << "}\n";
+    if (!o.access_trace.empty()) accesses.save(o, final_pager, trace_sources);
 }
 
 } // namespace
@@ -555,6 +626,7 @@ int main(int argc, char ** argv) {
         std::cout << "--model PATH --output JSON [--pager off|single|lru] [--budget 64MiB]\n"
             "--threads N --ctx N --batch N --ubatch N --prefill N --decode N --contexts 1|2\n"
             "--io mmap|buffered --warmup N --cache-state LABEL [--trace-prefix PATH] [--sample-decode-memory]\n"
+            "--expert-access-trace NEW.jsonl [--expert-trace-limit N] (Pager enabled, no warmup)\n"
             "--plan estimates the allocation without inference; use --plan --pager lru --slots N for an exact budget.\n";
         return 0;
     }

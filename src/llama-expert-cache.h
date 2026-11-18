@@ -30,6 +30,7 @@ public:
 
     // Return true only after writing all bytes. The reader must be thread-safe.
     using read_fn = bool (*)(void * context, key expert, void * dst, size_t bytes);
+    using trace_fn = void (*)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept;
 
     class lease {
     public:
@@ -67,6 +68,11 @@ public:
     size_t capacity() const { return slot_count; }
     lease acquire(key expert, size_t bytes);
     statistics stats() const;
+    // Install or remove only while inference is quiescent. Invoked under mutex.
+    void set_trace(trace_fn callback, void * context) noexcept {
+        trace = callback;
+        trace_context = context;
+    }
 
 private:
     void unlink(slot & storage);
@@ -85,4 +91,6 @@ private:
     slot * slots = nullptr;
     slot * newest = nullptr;
     slot * oldest = nullptr;
+    trace_fn trace = nullptr;
+    void * trace_context = nullptr;
 };

@@ -1475,6 +1475,9 @@ struct llama_external_experts {
                 owner.legacy.capacity_wait_ns += wait_ns;
                 ++owner.legacy.cache_misses;
                 ++owner.legacy.disk_reads;
+                if (owner.trace) {
+                    owner.trace(owner.trace_context, source.id, expert, bytes, false, 0);
+                }
                 const auto read_start = clock::now();
                 source.read(expert, owner.slot.data(), bytes);
                 owner.legacy.io_wait_ns += elapsed_ns(read_start);
@@ -1594,6 +1597,8 @@ struct llama_external_experts {
     llama_files files;
     ggml_backend_buffer_type_t buft = nullptr;
     size_t source_count = 0;
+    llama_pager_trace_fn trace = nullptr;
+    void * trace_context = nullptr;
     size_t planned_bytes = 0;
     size_t allocated_bytes = 0;
     size_t slots = 1;
@@ -2920,6 +2925,38 @@ size_t llama_model::pager_budget_for_slots(size_t slots) const {
 }
 
 llama_pager_metrics llama_get_pager_metrics(const llama_model * model) { return model->pager_metrics(); }
+void llama_model::set_pager_trace(llama_pager_trace_fn callback, void * context) {
+    if (!pimpl->external_experts) {
+        return;
+    }
+    auto & pager = *pimpl->external_experts;
+    if (pager.lru) {
+        pager.lru->cache->set_trace(callback, context);
+    } else {
+        pager.trace = callback;
+        pager.trace_context = context;
+    }
+}
+
+std::map<uint64_t, std::string> llama_model::pager_source_names() const {
+    std::map<uint64_t, std::string> result;
+    for (const auto & [name, tensor] : tensors_by_name) {
+        if ((tensor->flags & GGML_TENSOR_FLAG_EXTERNAL_EXPERT) && tensor->extra) {
+            const auto * provider = static_cast<const ggml_cpu_external_expert_source *>(tensor->extra);
+            const auto * source = static_cast<const llama_external_experts::tensor_source *>(provider->context);
+            result.emplace(source->id, name);
+        }
+    }
+    return result;
+}
+
+void llama_set_pager_trace(llama_model * model, llama_pager_trace_fn callback, void * context) {
+    model->set_pager_trace(callback, context);
+}
+
+std::map<uint64_t, std::string> llama_pager_source_names(const llama_model * model) {
+    return model->pager_source_names();
+}
 size_t llama_pager_budget_for_slots(const llama_model * model, size_t slots) { return model->pager_budget_for_slots(slots); }
 int64_t llama_model_metadata_load_us(const llama_model * model) { return model->t_metadata_us; }
 int64_t llama_model_weights_load_us(const llama_model * model) { return model->t_weights_us; }

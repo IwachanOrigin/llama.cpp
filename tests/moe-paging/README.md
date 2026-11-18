@@ -220,3 +220,130 @@ For Linux sanitizer runs, configure separate builds with both
 combining with `LLAMA_SANITIZE_UNDEFINED` and `GGML_SANITIZE_UNDEFINED`.
 Configure a separate build with `LLAMA_SANITIZE_THREAD` and `GGML_SANITIZE_THREAD`
 (and `GGML_OPENMP=OFF` if needed). Run the five paging CTests in each build.
+
+## Expert access tracing and offline replay
+
+Run the trace separately from timing measurements. Use the same input options,
+I/O mode and batching as the timed run. The access trace requires Pager enabled
+and zero in-process warmup, so prefill starts with an empty Expert cache.
+`--trace-prefix` is optional and changes prefill to request every logits row.
+Use it to reproduce the earlier synthetic 438-access run, or omit it to match
+the current benchmark's normal last-row-per-batch workload.
+
+PowerShell example for a local single-file or first-shard GGUF:
+
+```powershell
+$bench = 'build/bin/bench-expert-paging.exe'
+$model = 'D:/models/Qwen3-30B-A3B-Q4_K_M.gguf'
+$workload = @('--model', $model, '--threads', '4', '--ctx', '512', '--batch', '128', '--ubatch', '64', '--prefill', '128', '--decode', '32', '--io', 'mmap', '--contexts', '1')
+& $bench @workload --pager lru --slots 1024 --plan --output plan.json
+if ($LASTEXITCODE) { throw 'Could not size cache' }
+$plan = Get-Content plan.json -Raw | ConvertFrom-Json
+$required = $plan.model_buffer_bytes_including_pager + $plan.kv_bytes + $plan.workspace_bytes + 1GB + 48MB
+if ($required -gt $plan.available_physical_bytes) { throw 'Insufficient memory for this trace configuration' }
+& $bench @workload --pager lru --budget $plan.budget_bytes --required-available-bytes $required --expert-access-trace expert.jsonl --expert-trace-limit 1000000 --output trace-run.json
+if ($LASTEXITCODE) { throw 'Trace execution failed' }
+python tests/moe-paging/analyze-expert-trace.py expert.jsonl --output analysis.json
+python tests/moe-paging/test-expert-trace.py
+```
+
+The plan uses the exact managed Pager budget. Choose workload values from the
+timed run you want to explain. If 1024 slots exceed the memory limit, capture a
+smaller serial LRU run or the legacy `--pager single` path and replay the same
+trace at larger capacities. Trace storage is outside the Pager budget and is
+preallocated up to the requested event count. The example allows 48 MiB for
+one million records on a 64-bit build. Use a fresh output trace path.
+
+The JSONL header contains the source ID to tensor name map, total and dropped
+events, observed cache counters, and configured cache size. Each subsequent
+line is `[sequence, source_id, expert_id, bytes, slot, decode, hit]`.
+Layer and gate/up/down are derived from the tensor name. The event sequence
+is serialized by the existing Pager lock, at miss reservation and successful
+hit pin. Context IDs are unavailable at that interface. Under concurrency,
+I/O completion, pinning, and LRU order can diverge from reservation order.
+Serial LRU replay must reproduce observed outcomes and counters. The analyzer
+reports parallel differences without requiring equality, and rejects truncated
+traces. A failed inference does not produce a successful trace.
+
+Replay starts empty for each policy and preserves the prefill cache in
+decode. The capacity comparison uses the same fixed maximum Expert size for
+all policies. Reported slot payload excludes management bytes. The header
+records the real runtime's managed bytes for its observed capacity. Read
+counts represent reader calls. Selective admission ranks keys by full-trace
+frequency. Frequency-proportional layer allocation also uses the full trace.
+These are retrospective comparisons. Belady is the equal-slot optimum for
+mandatory insertion on each miss. The alternate policies run only offline.
+
+## Distributed CPU inference design
+
+The official Qwen3-30B-A3B configuration specifies 48 layers, hidden size
+2,048, expert intermediate size 768, top-8 routing, 128 experts per layer,
+four KV heads and head dimension 128. The three expert matrices are gate
+and up (2,048 by 768) and down (768 by 2,048). The reported 1,152 weight
+requests per decode token equal 48 layers times eight experts times three
+matrices. [Official model configuration](https://huggingface.co/Qwen/Qwen3-30B-A3B/raw/main/config.json)
+
+These are payload estimates for one sequence and FP32 activations. They
+exclude headers, acknowledgements, retransmits, and initial model placement.
+Multiply bytes per token by the desired tokens per second to size sustained
+link bandwidth.
+
+| Placement | Payload per token | Dependency and ownership |
+|---|---:|---|
+| Remote Expert weights | 1.02 GiB at the supplied observed read demand and all misses remote | Remote hosts store Expert weights. The coordinator retains local compute and KV. Without request coalescing, up to 1,152 reads can be on the token's path. |
+| Remote Expert compute, one input and output per selected expert | 6 MiB with every routed Expert remote | For each of 48 layers, 8 inputs and 8 outputs of 8 KiB each. Group dispatches by host and wait at the layer's merge. Hosts hold Expert weights and execute gate/up, activation and down. The coordinator holds attention, KV and routing. |
+| Remote Expert compute, one host per layer with remote weighted aggregation | 768 KiB | Each of 48 layers exchanges an 8 KiB activation and 8 KiB aggregate. Top-k IDs and weights or remote router computation are additional. Match local accumulation order if bitwise comparison is required. |
+| Contiguous Transformer stages | 8 KiB per boundary, one way | A stage holds all weights for its layers, including router and Experts, and retains those layers' KV. A single token passes through stages in dependency order. Logits/sampling placement may require a return message. |
+
+At the supplied 32/12.51 tokens/s, the first three rows imply respectively
+about 22.4 Gbit/s, 129 Mbit/s and 16.1 Mbit/s. The last row implies about
+0.168 Mbit/s per boundary. The first row's source number is logical demand
+from the supplied run, including reads served by the OS page cache. At 1 Gbit/s,
+moving 1.02 GiB alone takes about 8.8 seconds per token. For one dependent
+exchange per layer at 1 ms RTT, the Expert-compute round trips alone add at
+least 48 ms per token. For contiguous two-stage placement, the boundary
+activation can travel in one direction per token, with one return
+dependency if sampling is coordinated on the first host.
+
+The KV payload for FP16 K and V is 2 x 4 x 128 x 2 = 2,048 bytes per
+token per layer, or 96 KiB per token over 48 layers. A 24-layer stage keeps
+48 KiB per token, roughly 192 MiB for 4,096 slots before allocator and graph
+overhead. Extending Context or adding sequences raises this independently of
+the per-token link volume. Keep stage KV local and give every request a session
+and token position. On a lost peer, invalidate that session on the affected
+stages and replay the committed prefix, unless all stages can prove a common
+checkpoint. A remote weight fetch can be retried under an immutable model
+identity. A remote expert-compute request can be retried if it is stateless.
+Do not blindly retry a layer stage after it has appended KV.
+
+## Existing GGML RPC
+
+The repository's [RPC device implementation](../../ggml/src/ggml-rpc/ggml-rpc.cpp)
+already includes device discovery, buffer allocation and transfer, remote
+graph compute/recompute and a protocol handshake. Its supports-op callback
+currently returns true without asking the remote device. Use a representative
+CPU graph as a capability test. Initial buffer transfers can still be large
+if the coordinator loads and uploads all weights. RPC buffer handles are tied
+to an endpoint/device and graph reuse depends on that connection. Existing
+RPC neither defines an Expert slice or lease request nor turns a local
+CPU_ExternalExpert provider into a remote one. Its GGML graph messages should
+not be assumed to preserve local pointers or file handles across processes.
+
+The smallest useful next phase is a two-host CPU split at one contiguous
+layer boundary, with ordinary weight buffers for each stage, fixed model
+identity, one sequence, local KV on each host and an FP32 activation boundary.
+Start with a synthetic model and compare per-token logits and network bytes
+in an isolated lab. Then measure a real split model and load placement.
+Evaluate RPC's device/graph path for that prototype before designing a
+separate stage service. A worker-local GGUF and explicit reconnect/session
+semantics may need a separate layer. Expert-level remote compute comes next
+if placement balance or communication measurements warrant it. Remote
+weight fetch is useful as a comparison, but the measured miss traffic
+makes it a poor first target for ordinary LAN.
+
+For Windows/Linux interoperability, start with matching revisions, identical
+model and shard hashes, known CPU features and token/graph shapes, and fixed
+little-endian scalar encodings for any new cross-platform protocol. Validate
+tolerances separately from same-build bitwise comparisons. The [RPC
+documentation](../../tools/rpc/README.md) limits the current server to
+isolated testing. No cross-host or mixed-OS run was performed in this phase.
