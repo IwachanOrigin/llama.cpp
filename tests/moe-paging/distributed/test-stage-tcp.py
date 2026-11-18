@@ -1,0 +1,247 @@
+"""Run isolated baseline and two-process TCP tests against the paging fixture."""
+from contextlib import contextmanager
+import hashlib
+from pathlib import Path
+import queue
+import re
+import socket
+import struct
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
+from threading import Thread
+
+MAGIC = 0x53454F4D
+HEADER = struct.Struct("<6I")
+
+
+def verify(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def compare_floats(reference, actual, count):
+    left, right = reference.read_bytes(), actual.read_bytes()
+    verify(len(left) == len(right) == 4 * count, f"unexpected output length: {actual}")
+    if left != right:
+        a, b = struct.unpack(f"<{count}f", left), struct.unpack(f"<{count}f", right)
+        pairs = list(zip(a, b))
+        first = next(i for i in range(count) if left[4*i:4*i+4] != right[4*i:4*i+4])
+        raise RuntimeError(f"{actual}: first={first}, max_abs={max(abs(x-y) for x,y in pairs)}, "
+                           f"max_rel={max(abs(x-y)/max(abs(x), 1e-30) for x,y in pairs)}")
+
+
+def identity(model):
+    shards = [model]
+    if model.name.endswith("-00001-of-00002.gguf"):
+        shards.append(model.with_name(model.name.replace("-00001-", "-00002-")))
+    digest = hashlib.sha256()
+    for shard in shards:
+        digest.update(shard.stat().st_size.to_bytes(8, "little"))
+        with shard.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def command(exe, role, model, port, io, target, label, fault=None):
+    args = [exe, role, str(model), "1", "2", str(port), io, str(target), label]
+    return args if fault is None else args + [fault]
+
+
+def run(args, log, expected=0):
+    with log.open("wb") as out:
+        result = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, timeout=25)
+    text = log.read_text(errors="replace")
+    verify(result.returncode == expected, f"{args[1]} exited {result.returncode}\n{text[-4000:]}")
+    return text
+
+
+@contextmanager
+def start_worker(exe, model, io, prefix, label, fault=None, extra=()):
+    logfile = prefix.with_suffix(".log")
+    with logfile.open("wb") as log:
+        child = subprocess.Popen(command(exe, "worker", model, 0, io, prefix, label, fault) + list(extra),
+                                 stdout=subprocess.PIPE, stderr=log, text=True)
+        result = queue.Queue()
+        reader = Thread(target=lambda: result.put(child.stdout.readline()), daemon=True)
+        reader.start()
+        try:
+            ready = result.get(timeout=15)
+            verify(ready.startswith("READY "), f"Worker did not report READY (exit={child.poll()})")
+            yield child, int(ready.split()[1]), logfile
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            reader.join(timeout=2)
+            child.stdout.close()
+
+
+def distributed(exe, model, io, root, label):
+    baseline, front, back = [root / role for role in ("baseline", "front", "back")]
+    run(command(exe, "baseline", model, 0, io, baseline, label), root / "baseline.log")
+    with start_worker(exe, model, io, back, label) as (child, port, log):
+        with (root / "front.log").open("wb") as out:
+            coordinator = subprocess.Popen(command(exe, "coordinator", model, port, io, front, label),
+                                           stdout=out, stderr=subprocess.STDOUT)
+            verify(coordinator.pid != child.pid, "worker and coordinator must be distinct processes")
+            try:
+                code = coordinator.wait(timeout=25)
+            finally:
+                if coordinator.poll() is None:
+                    coordinator.kill()
+                    coordinator.wait(timeout=5)
+        a = (root / "front.log").read_text(errors="replace")
+        verify(code == 0, a[-4000:])
+        verify(child.wait(timeout=15) == 0, log.read_text(errors="replace")[-4000:])
+        b = log.read_text(errors="replace")
+        print(f"{root.name}: coordinator PID={coordinator.pid}, worker PID={child.pid}")
+    compare_floats(baseline.with_suffix(".boundary"), front.with_suffix(".boundary"), 5 * 512)
+    compare_floats(baseline.with_suffix(".logits"), front.with_suffix(".logits"), 5 * 128)
+    for layer, stage in enumerate((front, back)):
+        name = f".ffn_moe_topk-{layer}"
+        expected = Path(str(baseline) + name).read_bytes()
+        verify(len(expected) == 5 * 2 * 4 and expected == Path(str(stage) + name).read_bytes(),
+               f"Expert IDs differ at layer {layer}")
+        verify(not Path(str(stage) + f".ffn_moe_topk-{1-layer}").exists(), "unexpected expert graph")
+    counters = []
+    for layer, text in enumerate((a, b)):
+        verify(re.findall(r"compute position=(\d+) tokens=(\d+)", text) ==
+               [("0", "3"), ("3", "1"), ("4", "1")], "invalid position sequence")
+        owned = re.findall(r"^tensor blk\.(\d+)\.", text, re.MULTILINE)
+        verify(owned and set(owned) == {str(layer)}, "unexpected tensor inventory")
+        verify("experts=3 expert_bytes=53477376" in text and "kv=262144" in text and
+               re.search(r"pinned=0 reads=[1-9]", text) and "\nCLOSED" in text, "invalid Stage metrics")
+        totals = re.search(r"wire sent=(\d+) received=(\d+)", text)
+        verify(totals is not None, "missing transport counters")
+        counters.append((int(totals[1]), int(totals[2])))
+        for line in text.splitlines():
+            if re.match(r"(stage \[|wire |working_set=|roundtrip |compute position=)", line):
+                print(f"  stage {layer} {line}")
+    verify(counters[0] == counters[1][::-1], "send/receive counters disagree")
+    print(f"  {sum(counters[0])/5:.1f} socket bytes per token including handshake and close")
+
+
+def frame(kind, sid=0, rid=0, body=b"", version=1, length=None):
+    return HEADER.pack(MAGIC, version, kind, len(body) if length is None else length, sid, rid) + body
+
+
+def receive(peer, count):
+    data = bytearray()
+    while len(data) != count:
+        new = peer.recv(count - len(data))
+        verify(new, "peer closed while reading test response")
+        data.extend(new)
+    return bytes(data)
+
+
+def read_frame(peer):
+    magic, version, kind, size, sid, rid = HEADER.unpack(receive(peer, HEADER.size))
+    verify(magic == MAGIC and version == 1 and size <= (16 << 20), "bad response framing")
+    return kind, sid, rid, receive(peer, size)
+
+
+def execute_payload(hidden=512, position=0):
+    return struct.pack("<5I", 1, hidden, 0, 1, position) + struct.pack("<512f", *([0.01] * 512))
+
+
+def reject_raw(exe, model, root, label, reason, action):
+    with start_worker(exe, model, "mmap", root / action, label) as (child, port, log):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
+            if action == "idle":
+                peer.settimeout(15)
+                peer.sendall(frame(1)[:3])
+            elif action == "version":
+                peer.sendall(frame(1, version=42))
+            elif action == "oversize":
+                peer.sendall(frame(1, length=(16 << 20) + 1))
+            else:
+                candidate = ("0" * 64 if label != "0" * 64 else "1" * 64) if action == "model" else label
+                meta = struct.pack("<11I", 1, 2, 1, 1, 2, 512, 128, 1, 256, 8, len(candidate)) + candidate.encode("ascii")
+                peer.sendall(frame(1, body=meta))
+                if action != "model":
+                    verify(read_frame(peer) == (1, 0, 0, meta), "HELLO failed")
+                    peer.sendall(frame(2))
+                    kind, sid, rid, body = read_frame(peer)
+                    verify(kind == 7 and sid != 0 and rid == 0 and body == b"", "session OPEN failed")
+                    if action == "duplicate":
+                        peer.sendall(frame(3, sid, 1, execute_payload()))
+                        verify(read_frame(peer)[0] == 4, "first request failed")
+                    payload = execute_payload(hidden=511 if action == "hidden" else 512,
+                                              position=3 if action == "position" else 0)
+                    if action == "partial":
+                        peer.sendall(frame(3, sid, 1, payload)[:-32])
+                        peer.shutdown(socket.SHUT_WR)
+                    elif action == "unexpected":
+                        peer.sendall(frame(4, sid, 1))
+                    else:
+                        wrong_sid = (sid ^ 1) if action == "session" else sid
+                        peer.sendall(frame(3, wrong_sid, 1, payload))
+            kind, _, _, detail = read_frame(peer)
+            verify(kind == 6 and reason.encode() in detail, f"{action}: unexpected rejection {detail!r}")
+        verify(child.wait(timeout=15) != 0, "malformed request succeeded")
+        text = log.read_text(errors="replace")
+        verify(text.count("compute position=") == (1 if action == "duplicate" else 0) and "FAILED:" in text,
+               f"unexpected execution in {action}")
+        print(f"rejected {action}")
+
+
+def faults(exe, model, root, label):
+    for reason, scenario in (
+        ("unsupported protocol version", "version"), ("invalid frame length", "oversize"),
+        ("metadata mismatch", "model"), ("invalid hidden size", "hidden"),
+        ("unexpected token position", "position"), ("session or request", "duplicate"),
+        ("session or request", "session"), ("unexpected message", "unexpected"),
+        ("peer closed during frame", "partial"), ("TCP timeout", "idle"),
+    ):
+        reject_raw(exe, model, root, label, reason, scenario)
+    with socket.socket() as unused:
+        unused.bind(("127.0.0.1", 0))
+        port = unused.getsockname()[1]
+        # The port is reserved but has no listener.
+        report = run(command(exe, "coordinator", model, port, "mmap", root / "refused", label),
+                     root / "refused.log", expected=1)
+        verify("TCP connect" in report, "connection refusal not reported")
+        collision = run(command(exe, "worker", model, port, "mmap", root / "collision", label),
+                        root / "collision.log", expected=1)
+        verify("bind/listen failed" in collision, "bind collision not reported")
+    print("connection refused and bind collision detected")
+    for fault in ("after-receive", "after-decode"):
+        with start_worker(exe, model, "mmap", root / fault, label, fault) as (child, port, logfile):
+            output = root / f"aborted-{fault}"
+            text = run(command(exe, "coordinator", model, port, "mmap", output, label),
+                       output.with_suffix(".log"), expected=1)
+            verify(child.wait(timeout=15) != 0 and "FAILED" in text and "compute position=0" in text,
+                   "disconnected session did not fail")
+            verify(not output.with_suffix(".logits").exists() and "CLOSED" not in text,
+                   "failed session published output")
+            worker_log = logfile.read_text(errors="replace")
+            verify(("compute position=0" in worker_log) == (fault == "after-decode"),
+                   "fault injected at wrong point")
+            print(f"discarded session on disconnect {fault}")
+
+
+def main(exe, single, split, logs=None):
+    def test(root):
+        for index, model in enumerate(map(Path, (single, split))):
+            label = identity(model)
+            for io in ("mmap", "buffered"):
+                path = root / f"layout-{index}-{io}"
+                path.mkdir()
+                distributed(exe, model, io, path, label)
+            if index == 0:
+                path = root / "faults"
+                path.mkdir()
+                faults(exe, model, path, label)
+    if logs is not None:
+        root = Path(logs)
+        root.mkdir()
+        test(root)
+    else:
+        with TemporaryDirectory(prefix="qwen3moe-tcp-") as temp:
+            test(Path(temp))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

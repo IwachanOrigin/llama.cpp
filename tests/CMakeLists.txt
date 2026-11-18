@@ -420,6 +420,26 @@ if (GGML_CPU AND LLAMA_BUILD_TOOLS AND NOT CMAKE_CROSSCOMPILING AND NOT EMSCRIPT
             ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
             $<TARGET_FILE:test-qwen3moe-stage> $<TARGET_FILE:llama-gguf-split> stage)
         set_tests_properties(test-qwen3moe-stage PROPERTIES LABELS behavior TIMEOUT 120)
+        if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            llama_build(moe-paging/distributed/qwen3moe-stage-tcp.cpp LINK llama ggml Threads::Threads)
+            target_include_directories(qwen3moe-stage-tcp PRIVATE ../src ../ggml/src)
+            target_sources(qwen3moe-stage-tcp PRIVATE ../vendor/hash/sha256/sha256.c)
+            target_include_directories(qwen3moe-stage-tcp PRIVATE ../vendor/hash ../vendor/hash/sha256)
+            target_compile_definitions(qwen3moe-stage-tcp PRIVATE STAGE_BUILD_COMMIT="${LLAMA_BUILD_COMMIT}")
+            set_target_properties(qwen3moe-stage-tcp PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+            if (WIN32)
+                target_link_libraries(qwen3moe-stage-tcp PRIVATE ws2_32 psapi)
+            endif()
+            add_dependencies(qwen3moe-stage-tcp llama-gguf-split)
+            add_test(NAME test-qwen3moe-stage-tcp COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
+                $<TARGET_FILE:qwen3moe-stage-tcp> $<TARGET_FILE:llama-gguf-split> stage-tcp)
+            set_tests_properties(test-qwen3moe-stage-tcp PROPERTIES LABELS behavior TIMEOUT 150)
+            add_test(NAME test-qwen3moe-stage-lan-options COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/distributed/prepare-stage-fixture.py
+                --self-test $<TARGET_FILE:qwen3moe-stage-tcp> --splitter $<TARGET_FILE:llama-gguf-split>)
+            set_tests_properties(test-qwen3moe-stage-lan-options PROPERTIES LABELS behavior TIMEOUT 120)
+        endif()
     endif()
 endif()
 

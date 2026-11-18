@@ -10,6 +10,9 @@ moe-paging/*
 moe-paging/distributed/*
 !moe-paging/distributed/*.md
 !moe-paging/distributed/*.cpp
+!moe-paging/distributed/stage-tcp.h
+!moe-paging/distributed/test-stage-tcp.py
+!moe-paging/distributed/prepare-stage-fixture.py
 !moe-paging/*.cpp
 !moe-paging/*.py
 !moe-paging/README.md

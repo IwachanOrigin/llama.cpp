@@ -158,6 +158,10 @@ def main(probe, split, profile="lazy"):
         if profile == "stage":
             sys.stdout.buffer.write(run(probe, single, split_model))
             return
+        if profile == "stage-tcp":
+            sys.stdout.buffer.write(run(sys.executable,
+                Path(__file__).with_name("distributed") / "test-stage-tcp.py", probe, single, split_model))
+            return
         if profile == "lru":
             return check_lru(probe, root, single, split_model)
         if profile == "bench":
