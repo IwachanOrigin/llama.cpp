@@ -248,7 +248,7 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr, bool selected_only = false);
 
     // byte range within a mapped file
     struct mapping_range {

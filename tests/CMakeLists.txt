@@ -409,6 +409,17 @@ if (GGML_CPU AND LLAMA_BUILD_TOOLS AND NOT CMAKE_CROSSCOMPILING AND NOT EMSCRIPT
             ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
             $<TARGET_FILE:test-qwen3moe-lazy> $<TARGET_FILE:llama-gguf-split> lru)
         set_tests_properties(test-qwen3moe-lru PROPERTIES LABELS behavior TIMEOUT 120)
+        llama_build(moe-paging/distributed/test-qwen3moe-stage.cpp LINK llama ggml Threads::Threads)
+        target_include_directories(test-qwen3moe-stage PRIVATE ../src ../ggml/src)
+        set_target_properties(test-qwen3moe-stage PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+        if (WIN32)
+            target_link_libraries(test-qwen3moe-stage PRIVATE psapi)
+        endif()
+        add_dependencies(test-qwen3moe-stage llama-gguf-split)
+        add_test(NAME test-qwen3moe-stage COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/moe-paging/run.py
+            $<TARGET_FILE:test-qwen3moe-stage> $<TARGET_FILE:llama-gguf-split> stage)
+        set_tests_properties(test-qwen3moe-stage PROPERTIES LABELS behavior TIMEOUT 120)
     endif()
 endif()
 

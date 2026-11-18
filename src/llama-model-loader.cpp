@@ -1501,7 +1501,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         if (!partial) {
             throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
         }
-        LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
+        LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file\n",
                 __func__, n_created, n_tensors);
     }
     if (n_tensors_moved > 0) {
@@ -1511,7 +1511,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool selected_only) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1545,8 +1545,20 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 
     // compute the total size of all tensors for progress reporting
-    for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+    if (selected_only) {
+        size_data = 0;
+        for (const auto & entry : ctx_map) {
+            for (auto * tensor = ggml_get_first_tensor(entry.second.get()); tensor;
+                    tensor = ggml_get_next_tensor(entry.second.get(), tensor)) {
+                if (get_weight(tensor->name)) {
+                    size_data += ggml_nbytes(tensor);
+                }
+            }
+        }
+    } else {
+        for (const auto & it : weights_map) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 

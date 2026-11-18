@@ -785,6 +785,12 @@ struct llama_rope_params {
 };
 
 struct llama_model {
+    int32_t stage_begin = 0;
+    int32_t stage_end = -1;
+    int32_t stage_layer_end() const { return stage_end < 0 ? hparams.n_layer() : stage_end; }
+    bool stage_has_output() const { return stage_layer_end() == int32_t(hparams.n_layer()); }
+    bool is_partial_stage() const { return stage_begin != 0 || !stage_has_output(); }
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

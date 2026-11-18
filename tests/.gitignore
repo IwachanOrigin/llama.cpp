@@ -6,6 +6,10 @@
 !moe-paging/
 moe-paging/*
 !moe-paging/measurements/
+!moe-paging/distributed/
+moe-paging/distributed/*
+!moe-paging/distributed/*.md
+!moe-paging/distributed/*.cpp
 !moe-paging/*.cpp
 !moe-paging/*.py
 !moe-paging/README.md

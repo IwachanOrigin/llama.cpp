@@ -2148,6 +2148,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+    if (model.is_partial_stage()) {
+        const bool needs_activation = model.stage_begin > 0;
+        for (const auto & token : batch_inp.tokens) {
+            if (token.has_embd != needs_activation || token.embd_row >= 0 ||
+                    token.seq_ids.size() != 1 || token.seq_ids.count(0) == 0) {
+                LLAMA_LOG_ERROR("%s: stage requires its input type and sequence 0\n", __func__);
+                return -1;
+            }
+        }
+        if (needs_activation && batch_inp.n_embd != size_t(model.hparams.n_embd)) {
+            LLAMA_LOG_ERROR("%s: invalid stage activation width\n", __func__);
+            return -1;
+        }
+    }
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -2626,7 +2640,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = !cparams.embeddings || graph_has_logits;
+    bool has_logits     = model.stage_has_output() && (!cparams.embeddings || graph_has_logits);
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -4469,6 +4483,19 @@ llama_context * llama_init_from_model(
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
+    }
+    if (model->is_partial_stage()) {
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || params.n_seq_max > 1 ||
+                params.n_samplers || params.ctx_other) {
+            LLAMA_LOG_ERROR("%s: stages support only the default CPU context and sequence 0\n", __func__);
+            return nullptr;
+        }
+        params.n_seq_max = 1;
+        params.embeddings = !model->stage_has_output();
+        params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        if (params.embeddings) {
+            params.n_outputs_max = 0;
+        }
     }
 
     if (params.n_batch == 0 && params.n_ubatch == 0) {

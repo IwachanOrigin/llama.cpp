@@ -155,6 +155,9 @@ def main(probe, split, profile="lazy"):
         run(sys.executable, Path(__file__).with_name("make_fixture.py"), single)
         run(split, "--split-max-tensors", "13", single, prefix)
         split_model = root / "split-00001-of-00002.gguf"
+        if profile == "stage":
+            sys.stdout.buffer.write(run(probe, single, split_model))
+            return
         if profile == "lru":
             return check_lru(probe, root, single, split_model)
         if profile == "bench":

@@ -2108,6 +2108,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
+            if (is_partial_stage() && (i < stage_begin || i >= stage_layer_end())) {
+                continue;
+            }
             auto & layer = layers[i];
 
             if (hparams.has_kv(i)) {
@@ -2271,7 +2274,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(is_partial_stage());
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
@@ -2294,7 +2297,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!is_partial_stage(), use_mlock ? &pimpl->mlock_mmaps : nullptr, is_partial_stage());
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -3919,7 +3922,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
-
+                        if (is_partial_stage()) {
+                            filter = [this](uint32_t layer) {
+                                return layer >= uint32_t(stage_begin) && layer < uint32_t(stage_layer_end());
+                            };
+                        }
                         res = new llama_kv_cache(
                                 *this,
                                 params.no_alloc,

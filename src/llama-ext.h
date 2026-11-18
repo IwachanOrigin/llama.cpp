@@ -121,6 +121,9 @@ struct llama_pager_metrics {
     uint64_t io_wait_ns, cache_wait_ns, capacity_wait_ns, lease_wait_ns;
     size_t pinned_slots, peak_allocated_bytes, slots, max_expert_bytes;
 };
+// Qwen3MoE CPU stage with an exclusive upper layer bound.
+LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_params params,
+                                              int32_t layer_begin, int32_t layer_end);
 using llama_pager_trace_fn = void (*)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept;
 // Call only while no contexts using this model are computing.
 LLAMA_API void llama_set_pager_trace(llama_model * model, llama_pager_trace_fn callback, void * context);

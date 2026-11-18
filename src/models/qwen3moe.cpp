@@ -14,17 +14,19 @@ void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-
-    // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+    if (stage_begin == 0) {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    }
+    if (stage_has_output()) {
+        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+        if (!output) {
+            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
+                    tok_embd ? TENSOR_DUPLICATED : 0);
+        }
     }
 
-    for (int i = 0; i < n_layer; ++i) {
+    for (int i = stage_begin; i < stage_layer_end(); ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
@@ -71,16 +73,25 @@ llama_model_qwen3moe::graph::graph(const llm_graph_params & params) : llm_graph_
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    if (model.stage_begin == 0) {
+        inpL = build_inp_embd(model.tok_embd);
+    } else {
+        auto input = std::make_unique<llm_graph_input_embd>(n_embd);
+        input->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+        inpL = input->embd;
+        ggml_set_input(inpL);
+        cb(inpL, "stage_input", -1);
+        res->add_input(std::move(input));
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
     auto * inp_attn = build_attn_inp_kv();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = model.stage_has_output() ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = model.stage_begin; il < model.stage_layer_end(); ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -156,6 +167,13 @@ llama_model_qwen3moe::graph::graph(const llm_graph_params & params) : llm_graph_
         inpL = cur;
     }
     cur = inpL;
+    if (!model.stage_has_output()) {
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        res->t_embd = ggml_cont(ctx0, cur);
+        cb(res->t_embd, "stage_output", -1);
+        ggml_build_forward_expand(gf, res->t_embd);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

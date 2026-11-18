@@ -5,6 +5,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-ext.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -321,7 +322,8 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
-        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+        const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params,
+        int32_t stage_begin, int32_t stage_end) {
     try {
         if (params.external_expert_cache_size && !params.external_experts) {
             throw std::runtime_error("external Expert cache requires external_experts");
@@ -362,6 +364,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        if (stage_end >= 0) {
+            if (model->arch != LLM_ARCH_QWEN3MOE || stage_begin < 0 ||
+                    stage_begin >= stage_end || uint32_t(stage_end) > model->hparams.n_layer()) {
+                throw std::runtime_error("invalid Qwen3MoE stage range");
+            }
+            model->stage_begin = stage_begin;
+            model->stage_end = stage_end;
+        }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
@@ -399,7 +409,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         const std::string & path_model,
         std::vector<std::string> & splits,
         FILE * file,
-        struct llama_model_params params) {
+        struct llama_model_params params,
+        int32_t stage_begin = 0, int32_t stage_end = -1) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -441,7 +452,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
+    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
+        path_model, splits, file, params, stage_begin, stage_end);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -457,6 +469,22 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     return model;
+}
+
+llama_model * llama_model_load_stage(const char * path, llama_model_params params,
+                                    int32_t layer_begin, int32_t layer_end) {
+    if (!path || layer_end <= 0 || params.vocab_only || params.load_mtp ||
+            params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
+            params.tensor_buft_overrides || params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        LLAMA_LOG_ERROR("%s: invalid CPU stage options\n", __func__);
+        return nullptr;
+    }
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    params.devices = cpu_only;
+    params.n_gpu_layers = 0;
+    std::vector<std::string> splits;
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path, splits, nullptr,
+        params, layer_begin, layer_end);
 }
 
 struct llama_model * llama_model_init_from_user(
