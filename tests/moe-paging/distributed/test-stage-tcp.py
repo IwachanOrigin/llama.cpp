@@ -1,6 +1,7 @@
 """Run isolated baseline and two-process TCP tests against the paging fixture."""
 from contextlib import contextmanager
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import queue
 import re
@@ -222,6 +223,91 @@ def faults(exe, model, root, label):
             print(f"discarded session on disconnect {fault}")
 
 
+def generation(exe, model, root, label):
+    options = ["--generate", "--prompt-tokens", "1,19,7", "--max-new-tokens", "4",
+               "--sampling", "greedy", "--ctx", "8", "--batch", "2"]
+    worker_options = ["--ctx", "8", "--batch", "2"]
+    baseline = root / "gen-baseline"
+    front = root / "gen-front"
+    expected = [(0, 2), (2, 1), (3, 1), (4, 1), (5, 1)]
+    log_ref = run(command(exe, "baseline", model, 0, "mmap", baseline, label) + options,
+                  root / "gen-baseline.log")
+    with start_worker(exe, model, "mmap", root / "gen-worker", label, extra=worker_options) as (child, port, log):
+        log_front = run(command(exe, "coordinator", model, port, "mmap", front, label) + options,
+                        root / "gen-front.log")
+        verify(child.wait(timeout=15) == 0, "generation Worker failed")
+        for text in (log_ref, log_front, log.read_text(errors="replace")):
+            history = [(int(position), int(count)) for position, count in
+                       re.findall(r"compute position=([0-9]+) tokens=([0-9]+)", text)]
+            verify(history == expected and "pinned=0" in text, f"incorrect autoregressive history: {history}")
+    a, b = (prefix.with_suffix(".generated_tokens").read_bytes() for prefix in (baseline, front))
+    verify(len(a) == 16 and a == b and "stop=limit" in log_front, "generation tokens or limit differ")
+    verify(not front.with_suffix(".logits").exists(), "generation persisted full logits")
+    verify(front.with_suffix(".generated.txt").read_bytes() == b"", "tokenizer-free fixture emitted text")
+
+    context_options = options.copy()
+    context_options[context_options.index("--ctx") + 1] = "3"
+    context_log = run(command(exe, "baseline", model, 0, "mmap", root / "context", label) + context_options,
+                      root / "context.log")
+    verify("prompt_tokens=3 generated_tokens=1 stop=context" in context_log, "context stop was missed")
+    prompt = root / "prompt.txt"
+    prompt.write_text("sample", encoding="utf-8")
+    rejected = run(command(exe, "baseline", model, 0, "mmap", root / "no-tokenizer", label) +
+                   ["--generate", "--prompt-file", str(prompt), "--max-new-tokens", "1"],
+                   root / "no-tokenizer.log", expected=1)
+    verify("model has no tokenizer" in rejected, "missing tokenizer was accepted")
+    rejected = run(command(exe, "baseline", model, 0, "mmap", root / "mixed-mode", label) +
+                   options + ["--tokens", "1,2"], root / "mixed-mode.log", expected=1)
+    verify("cannot be combined" in rejected, "mixed generation and fixed input were accepted")
+    with start_worker(exe, model, "mmap", root / "gen-fault", label,
+                      "after-decode", extra=worker_options) as (child, port, _):
+        aborted = root / "gen-aborted"
+        run(command(exe, "coordinator", model, port, "mmap", aborted, label) + options,
+            root / "gen-aborted.log", expected=1)
+        verify(child.wait(timeout=15) != 0 and not aborted.with_suffix(".generated_tokens").exists()
+               and not aborted.with_suffix(".generated.txt").exists(), "aborted generation published output")
+    print("autoregressive IDs, chunked prefill, limits, validation and failure publication verified")
+
+    for nonfinite in (None, float("nan"), float("inf")):
+        with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as pool:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(8)
+
+            def scripted_worker():
+                conn, _ = listener.accept()
+                with conn:
+                    conn.settimeout(8)
+                    hello = read_frame(conn)
+                    conn.sendall(frame(1, body=hello[3]))
+                    verify(read_frame(conn)[0] == 2, "missing OPEN")
+                    conn.sendall(frame(7, sid=1))
+                    verify(read_frame(conn)[:3] == (3, 1, 1), "missing prompt request")
+                    logits = [0.0] * 128
+                    logits[6] = logits[7] = 1.0
+                    if nonfinite is not None:
+                        logits[100] = nonfinite
+                    conn.sendall(frame(4, 1, 1, struct.pack("<3I128f", 0, 1, 128, *logits)))
+                    expected = 5 if nonfinite is None else 6
+                    verify(read_frame(conn)[0] == expected, "unexpected generation protocol outcome")
+                    if nonfinite is None:
+                        conn.sendall(frame(7, 1, 2))
+
+            pending = pool.submit(scripted_worker)
+            output = root / ("tie" if nonfinite is None else f"reject-{nonfinite}")
+            log = run(command(exe, "coordinator", model, listener.getsockname()[1], "mmap", output, label) +
+                      ["--generate", "--prompt-tokens", "1", "--max-new-tokens", "1"],
+                      output.with_suffix(".log"), expected=int(nonfinite is not None))
+            pending.result(timeout=10)
+            if nonfinite is None:
+                verify(output.with_suffix(".generated_tokens").read_bytes() == struct.pack("<I", 6),
+                       "tie did not select the lowest maximum ID")
+            else:
+                verify("non-finite" in log and not output.with_suffix(".generated_tokens").exists(),
+                       "non-finite logits were published")
+    print("greedy maximum, lowest-ID tie and non-finite logits verified")
+
+
 def main(exe, single, split, logs=None):
     def test(root):
         for index, model in enumerate(map(Path, (single, split))):
@@ -234,6 +320,9 @@ def main(exe, single, split, logs=None):
                 path = root / "faults"
                 path.mkdir()
                 faults(exe, model, path, label)
+                path = root / "generation"
+                path.mkdir()
+                generation(exe, model, path, label)
     if logs is not None:
         root = Path(logs)
         root.mkdir()

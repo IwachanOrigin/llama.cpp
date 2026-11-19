@@ -151,6 +151,10 @@ struct options {
     uint32_t connect_ms = 10000, accept_ms = 10000, frame_ms = 10000, response_ms = 10000;
     bool auto_identity = false;
     std::vector<llama_token> tokens{1, 19, 7, 42, 51};
+    bool generate = false, fixed_input_set = false;
+    uint32_t max_new_tokens = 0;
+    std::string prompt_file{};
+    std::vector<llama_token> prompt_tokens{};
 };
 
 static uint32_t number(const std::string & value, uint32_t max) {
@@ -205,6 +209,17 @@ static std::string model_identity(const std::string & filename) {
     return label.str();
 }
 
+static std::vector<llama_token> token_list(const std::string & value) {
+    std::vector<llama_token> tokens;
+    size_t begin = 0;
+    for (;;) {
+        const size_t comma = value.find(',', begin);
+        tokens.push_back(number(value.substr(begin, comma - begin), INT32_MAX));
+        if (comma == std::string::npos) return tokens;
+        begin = comma + 1;
+    }
+}
+
 static void parse_options(options & cfg, int argc, char ** argv) {
     for (int i = 8; i < argc; ++i) {
         const std::string key = argv[i];
@@ -216,8 +231,25 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             cfg.fault = key;
             continue;
         }
+        if (key == "--generate") {
+            cfg.generate = true;
+            continue;
+        }
         require(i + 1 < argc, "option requires a value");
         const std::string value = argv[++i];
+        if (key == "--prompt-file") {
+            require(!value.empty(), "prompt path cannot be empty");
+            cfg.prompt_file = value;
+            continue;
+        }
+        if (key == "--sampling") {
+            require(value == "greedy", "only greedy sampling is supported");
+            continue;
+        }
+        if (key == "--prompt-tokens") {
+            cfg.prompt_tokens = token_list(value);
+            continue;
+        }
         if (key == "--output-dir") {
             const auto path = std::filesystem::u8path(value);
             std::filesystem::create_directories(path);
@@ -225,14 +257,8 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             continue;
         }
         if (key == "--tokens") {
-            cfg.tokens.clear();
-            size_t begin = 0;
-            for (;;) {
-                const size_t comma = value.find(',', begin);
-                cfg.tokens.push_back(number(value.substr(begin, comma - begin), INT32_MAX));
-                if (comma == std::string::npos) break;
-                begin = comma + 1;
-            }
+            cfg.tokens = token_list(value);
+            cfg.fixed_input_set = true;
             continue;
         }
         const uint32_t n = number(value, 1000000);
@@ -241,7 +267,11 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         else if (key == "--batch") cfg.batch = n;
         else if (key == "--threads") cfg.threads = n;
         else if (key == "--pager-budget-mib") cfg.pager_mib = n;
-        else if (key == "--prefill") cfg.prefill = n;
+        else if (key == "--prefill") {
+            cfg.prefill = n;
+            cfg.fixed_input_set = true;
+        }
+        else if (key == "--max-new-tokens") cfg.max_new_tokens = n;
         else if (key == "--connect-timeout-ms") cfg.connect_ms = n;
         else if (key == "--accept-timeout-ms") cfg.accept_ms = n;
         else if (key == "--frame-timeout-ms") cfg.frame_ms = n;
@@ -256,6 +286,9 @@ struct artifacts {
     bytes logits, boundary;
     std::map<std::string, bytes> expert_ids;
     std::string boundary_name;
+    bool generation = false;
+    bytes generated_tokens;
+    std::string generated_text;
 
     static bool eval(ggml_tensor * tensor, bool ask, void * user) {
         auto & self = *static_cast<artifacts *>(user);
@@ -288,6 +321,11 @@ struct artifacts {
             if (!data.empty()) out.write(reinterpret_cast<const char *>(data.data()), data.size());
             out.close();
         };
+        if (generation) {
+            write(".generated.txt", bytes(generated_text.begin(), generated_text.end()));
+            write(".generated_tokens", generated_tokens);
+            return;
+        }
         write(".logits", logits);
         write(".boundary", boundary);
         for (const auto & entry : expert_ids) write("." + entry.first, entry.second);
@@ -302,6 +340,7 @@ struct stage {
     uint32_t hidden, vocab;
 
     explicit stage(const options & cfg) : output(cfg.output) {
+        output.generation = cfg.generate;
         const bool baseline = cfg.role == "baseline";
         begin = cfg.role == "worker" ? cfg.split : 0;
         end = cfg.role == "coordinator" ? cfg.split : cfg.layers;
@@ -317,8 +356,8 @@ struct stage {
         vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         require(hidden && vocab && 16 + uint64_t(cfg.batch) * (4 + uint64_t(hidden)*4) <= cap &&
                 12 + uint64_t(cfg.batch) * vocab*4 <= cap, "batch/model dimensions exceed 16 MiB frame limit");
-        require(cfg.prefill <= cfg.batch && cfg.prefill <= cfg.tokens.size() && cfg.tokens.size() <= cfg.ctx &&
-                std::all_of(cfg.tokens.begin(), cfg.tokens.end(), [&](llama_token id) { return uint32_t(id) < vocab; }),
+        require(cfg.generate || cfg.role == "worker" || (cfg.prefill <= cfg.batch && cfg.prefill <= cfg.tokens.size() && cfg.tokens.size() <= cfg.ctx &&
+                std::all_of(cfg.tokens.begin(), cfg.tokens.end(), [&](llama_token id) { return uint32_t(id) < vocab; })),
                 "invalid token sequence, prefill, batch or context");
         if (baseline) output.boundary_name = "l_out-" + std::to_string(cfg.split - 1);
         auto cp = llama_context_default_params();
@@ -326,7 +365,7 @@ struct stage {
         cp.n_batch = cp.n_ubatch = cfg.batch;
         cp.n_threads = cp.n_threads_batch = cfg.threads;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-        cp.cb_eval = artifacts::eval;
+        cp.cb_eval = cfg.generate ? nullptr : artifacts::eval;
         cp.cb_eval_user_data = &output;
         context.reset(llama_init_from_model(model.get(), cp));
         require(bool(context), "cannot create stage context");
@@ -397,10 +436,11 @@ struct stage {
         }
 #endif
         std::fprintf(stderr, "stage [%u,%u) ordinary=%zu normal_bytes=%zu experts=%zu expert_bytes=%zu "
-                "pager=%zu kv=%zu workspace=%zu pinned=%zu reads=%llu hits=%llu read_bytes=%llu\n",
+                "pager=%zu kv=%zu workspace=%zu pinned=%zu reads=%llu hits=%llu read_bytes=%llu misses=%llu io_wait_ns=%llu\n",
                 begin, end, ordinary, normal_bytes, experts, expert_bytes, stats.peak_allocated_bytes,
                 kv, workspace, stats.pinned_slots, (unsigned long long) stats.disk_reads,
-                (unsigned long long) stats.cache_hits, (unsigned long long) stats.bytes_read);
+                (unsigned long long) stats.cache_hits, (unsigned long long) stats.bytes_read,
+                (unsigned long long) stats.cache_misses, (unsigned long long) stats.io_wait_ns);
     }
 };
 
@@ -464,6 +504,76 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
     }
 }
 
+static std::string checked_utf8(const std::string & input, bool replace) {
+    std::string output;
+    for (size_t i = 0; i < input.size();) {
+        const uint8_t first = input[i];
+        const size_t width = first < 0x80 ? 1 : first >= 0xc2 && first <= 0xdf ? 2 :
+            first >= 0xe0 && first <= 0xef ? 3 : first >= 0xf0 && first <= 0xf4 ? 4 : 0;
+        bool valid = width && width <= input.size() - i;
+        for (size_t j = 1; valid && j < width; ++j) {
+            const uint8_t next = input[i + j];
+            valid = (next & 0xc0) == 0x80 &&
+                (j != 1 || ((first != 0xe0 || next >= 0xa0) && (first != 0xed || next < 0xa0) &&
+                           (first != 0xf0 || next >= 0x90) && (first != 0xf4 || next < 0x90)));
+        }
+        if (valid) {
+            output.append(input, i, width);
+            i += width;
+        } else {
+            require(replace, "prompt is not valid UTF-8");
+            output += "\xef\xbf\xbd";
+            ++i;
+        }
+    }
+    return output;
+}
+
+static std::vector<llama_token> generation_prompt(const options & cfg, const llama_vocab * vocab) {
+    if (!cfg.prompt_tokens.empty()) return cfg.prompt_tokens;
+    require(llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE, "model has no tokenizer");
+    std::ifstream file(std::filesystem::u8path(cfg.prompt_file), std::ios::binary | std::ios::ate);
+    require(bool(file), "cannot open prompt file");
+    const auto length = file.tellg();
+    require(length > 0 && length <= 16 * 1024 * 1024, "prompt file must contain 1 to 16 MiB of UTF-8 data");
+    std::string text(size_t(length), '\0');
+    file.seekg(0);
+    require(bool(file.read(text.data(), text.size())), "cannot read prompt file");
+    if (text.compare(0, 3, "\xef\xbb\xbf") == 0) text.erase(0, 3);
+    require(!text.empty(), "empty prompt");
+    checked_utf8(text, false);
+    const int capacity = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, false);
+    require(capacity < 0 && capacity != INT32_MIN, "cannot size prompt tokens");
+    std::vector<llama_token> tokens(-capacity);
+    const int count = llama_tokenize(vocab, text.data(), text.size(), tokens.data(), tokens.size(), true, false);
+    require(count > 0 && size_t(count) <= tokens.size(), "cannot tokenize prompt");
+    tokens.resize(count);
+    return tokens;
+}
+
+static llama_token greedy(const std::vector<float> & logits) {
+    require(!logits.empty(), "missing generation logits");
+    llama_token best = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        require(std::isfinite(logits[i]), "non-finite generation logits");
+        if (logits[i] > logits[best]) best = llama_token(i);
+    }
+    return best;
+}
+
+static std::string generation_text(const llama_vocab * vocab, const std::vector<llama_token> & tokens) {
+    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE || tokens.empty()) return {};
+    const int capacity = llama_detokenize(vocab, tokens.data(), tokens.size(), nullptr, 0, true, false);
+    if (capacity == 0) return {};
+    require(capacity < 0 && capacity != INT32_MIN, "cannot size generated text");
+    std::string text(-capacity, '\0');
+    const int count = llama_detokenize(vocab, tokens.data(), tokens.size(), text.data(), text.size(), true, false);
+    require(count >= 0 && size_t(count) <= text.size(), "cannot detokenize generation");
+    text.resize(count);
+    // A token limit can leave an incomplete UTF-8 sequence at the end.
+    return checked_utf8(text, true);
+}
+
 static void coordinator(const options & cfg, stage & local, channel * wire, state & status,
                         uint32_t & session, uint32_t & request) {
     if (wire) {
@@ -479,19 +589,30 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         session = ready.session;
     }
     status = state::active;
-    auto tokens = cfg.tokens;
+    const auto * vocab = llama_model_get_vocab(local.model.get());
+    auto tokens = cfg.generate ? generation_prompt(cfg, vocab) : cfg.tokens;
+    const uint32_t context_limit = std::min(cfg.ctx, llama_n_ctx(local.context.get()));
+    require(tokens.size() <= context_limit &&
+            std::all_of(tokens.begin(), tokens.end(), [&](llama_token id) { return uint32_t(id) < local.vocab; }),
+            "prompt tokens exceed context or vocabulary");
     request = 1;
-    for (uint32_t offset = 0; offset < tokens.size();) {
-        const uint32_t count = offset == 0 ? cfg.prefill : 1;
+    auto evaluate = [&](llama_token * input, uint32_t offset, uint32_t count) {
         std::vector<llama_pos> positions(count);
         for (uint32_t i = 0; i < count; ++i) positions[i] = offset + i;
         std::vector<int8_t> outputs(count, 1);
-        auto batch = llama_batch_get_one(tokens.data() + offset, count);
+        auto batch = llama_batch_get_one(input, count);
         batch.pos = positions.data();
         batch.logits = outputs.data();
         local.compute(batch);
+        std::vector<float> last;
         if (!wire) {
-            local.logits(local.output.logits, count);
+            if (cfg.generate) {
+                const auto * values = llama_get_logits_ith(local.context.get(), count - 1);
+                require(values, "missing generation logits");
+                last.assign(values, values + local.vocab);
+            } else {
+                local.logits(local.output.logits, count);
+            }
         } else {
             bytes activation;
             for (auto field : {count, local.hidden, 0u, wire_f32}) put(activation, field);
@@ -500,7 +621,9 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
             require(values, "missing stage boundary");
             for (size_t i = 0; i < size_t(count) * local.hidden; ++i) put_float(activation, values[i]);
             const size_t data_offset = 16 + 4 * count;
-            local.output.boundary.insert(local.output.boundary.end(), activation.begin() + data_offset, activation.end());
+            if (!cfg.generate) {
+                local.output.boundary.insert(local.output.boundary.end(), activation.begin() + data_offset, activation.end());
+            }
             const auto start = steady_clock::now();
             wire->send({execute_stage, session, request, std::move(activation)});
             const auto result = wire->receive(cfg.response_ms);
@@ -508,12 +631,52 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
             expect(result, stage_result, session, request);
             reader r{result.body};
             require(r.word() == 0 && r.word() == count && r.word() == local.vocab, "invalid output shape or status");
-            floats(r, count, local.vocab);
-            local.output.logits.insert(local.output.logits.end(), result.body.begin() + 12, result.body.end());
+            const auto remote_logits = floats(r, count, local.vocab);
+            if (cfg.generate) {
+                last.assign(remote_logits.end() - local.vocab, remote_logits.end());
+            } else {
+                local.output.logits.insert(local.output.logits.end(), result.body.begin() + 12, result.body.end());
+            }
             std::fprintf(stderr, "roundtrip request=%u tokens=%u ms=%.3f\n", request, count, ms);
         }
         ++request;
+        return last;
+    };
+    const auto prefill_start = steady_clock::now();
+    std::vector<float> last;
+    for (uint32_t offset = 0; offset < tokens.size();) {
+        const uint32_t count = cfg.generate ? std::min<uint32_t>(cfg.batch, tokens.size() - offset) :
+            (offset == 0 ? cfg.prefill : 1);
+        last = evaluate(tokens.data() + offset, offset, count);
         offset += count;
+    }
+    if (cfg.generate) {
+        const auto decode_start = steady_clock::now();
+        const double prefill_ms = std::chrono::duration<double, std::milli>(decode_start - prefill_start).count();
+        std::vector<llama_token> generated;
+        uint32_t next_position = tokens.size();
+        const char * reason = "limit";
+        for (uint32_t step = 0; step < cfg.max_new_tokens; ++step) {
+            auto token = greedy(last);
+            generated.push_back(token);
+            if (llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE && llama_vocab_is_eog(vocab, token)) {
+                reason = "eog";
+                break;
+            }
+            if (step + 1 == cfg.max_new_tokens) break;
+            if (next_position == context_limit) {
+                reason = "context";
+                break;
+            }
+            last = evaluate(&token, next_position++, 1);
+        }
+        const double decode_ms = std::chrono::duration<double, std::milli>(steady_clock::now() - decode_start).count();
+        local.output.generated_text = generation_text(vocab, generated);
+        for (auto token : generated) put(local.output.generated_tokens, uint32_t(token));
+        std::fprintf(stderr, "generation prompt_tokens=%zu generated_tokens=%zu stop=%s prefill_ms=%.3f "
+                "decode_ms=%.3f ms_per_token=%.3f tokens_per_sec=%.3f\n",
+                tokens.size(), generated.size(), reason, prefill_ms, decode_ms, decode_ms / generated.size(),
+                decode_ms > 0 ? 1000 * generated.size() / decode_ms : 0);
     }
     if (wire) {
         wire->send({close_session, session, request, {}});
@@ -530,6 +693,17 @@ int main(int argc, char ** argv) {
             number(argv[5], 65535), number(argv[3], 65535), number(argv[4], 65535)};
         parse_options(cfg, argc, argv);
         require(cfg.role == "worker" || cfg.role == "coordinator" || cfg.role == "baseline", "invalid role");
+        require(!cfg.generate ? (cfg.prompt_file.empty() && cfg.prompt_tokens.empty() && !cfg.max_new_tokens) :
+                (cfg.role != "worker" && !cfg.fixed_input_set && cfg.max_new_tokens &&
+                 (cfg.prompt_file.empty() != cfg.prompt_tokens.empty())),
+                "generation requires baseline/coordinator, --max-new-tokens and exactly one prompt source; "
+                "fixed --tokens/--prefill cannot be combined with --generate");
+        if (cfg.generate) {
+            for (const char * suffix : {".generated_tokens", ".generated.txt"}) {
+                require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + suffix)),
+                        "use a fresh generation output prefix");
+            }
+        }
         require(cfg.split && cfg.split < cfg.layers && (cfg.io == "mmap" || cfg.io == "buffered"), "invalid stage configuration");
         cfg.auto_identity = cfg.identity == "auto";
         require(cfg.auto_identity || cfg.identity.empty() || (cfg.identity.size() == 64 &&
