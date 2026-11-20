@@ -1,6 +1,9 @@
 """Run isolated baseline and two-process TCP tests against the paging fixture."""
 from contextlib import contextmanager
 import hashlib
+import csv
+import json
+import runpy
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import queue
@@ -245,6 +248,43 @@ def generation(exe, model, root, label):
     verify(not front.with_suffix(".logits").exists(), "generation persisted full logits")
     verify(front.with_suffix(".generated.txt").read_bytes() == b"", "tokenizer-free fixture emitted text")
 
+    profiled = root / "profile-baseline"
+    profiled_front = root / "profile-front"
+    profiled_worker = root / "profile-worker"
+    run(command(exe, "baseline", model, 0, "mmap", profiled, label) + options + ["--perf-details"],
+        root / "profile-baseline.log")
+    with start_worker(exe, model, "mmap", profiled_worker, label,
+                      extra=worker_options + ["--perf-details"]) as (child, port, _):
+        run(command(exe, "coordinator", model, port, "mmap", profiled_front, label) +
+            options + ["--perf-details"], root / "profile-front.log")
+        verify(child.wait(timeout=15) == 0, "profile Worker failed")
+    verify(profiled.with_suffix(".generated_tokens").read_bytes() == a and
+           profiled_front.with_suffix(".generated_tokens").read_bytes() == b,
+           "profiling changed generation")
+    verify(not baseline.with_suffix(".metrics.json").exists(), "profiling was not opt-in")
+    analyze = runpy.run_path(str(Path(__file__).with_name("analyze-stage-performance.py")))
+    summaries, phases = analyze["compare"]([prefix.with_suffix(".metrics.json") for prefix in (
+        profiled, profiled_front, profiled_worker)])
+    verify(summaries[0]["generation"]["prefill_batches"] == 2 and
+           summaries[0]["generation"]["decode_steps"] == 3 and
+           summaries[0]["stage"]["stage_execution_calls"] == 5 and
+           summaries[0]["stage"]["stage_execution_min_ms"] <= summaries[0]["stage"]["stage_execution_avg_ms"] <=
+           summaries[0]["stage"]["stage_execution_max_ms"], "profile aggregate is inconsistent")
+    verify(phases["decode"]["worker_reads"] > 0, "worker Pager counters were not recorded")
+    with profiled.with_suffix(".perf.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    verify(len(rows) == 5 and all(row["receive_bytes"] == "" for row in rows) and
+           sum(int(row["pager_read_count_delta"]) for row in rows) == summaries[0]["pager"]["disk_reads"],
+           "baseline CSV does not reconcile with summary")
+
+    zero = root / "profile-zero"
+    run(command(exe, "baseline", model, 0, "mmap", zero, label) +
+        options + ["--perf-details", "--max-new-tokens", "1"], root / "profile-zero.log")
+    metrics = json.loads(zero.with_suffix(".metrics.json").read_text())
+    verify(metrics["generation"]["decode_steps"] == 0 and metrics["generation"]["decode_step_wall_ms"] == 0 and
+           metrics["generation"]["decode_tokens_per_sec"] is None and
+           metrics["phases"]["decode"]["stage_execution_avg_ms"] is None, "zero-decode schema mismatch")
+
     context_options = options.copy()
     context_options[context_options.index("--ctx") + 1] = "3"
     context_log = run(command(exe, "baseline", model, 0, "mmap", root / "context", label) + context_options,
@@ -269,10 +309,13 @@ def generation(exe, model, root, label):
     with start_worker(exe, model, "mmap", root / "gen-fault", label,
                       "after-decode", extra=worker_options) as (child, port, _):
         aborted = root / "gen-aborted"
-        run(command(exe, "coordinator", model, port, "mmap", aborted, label) + options,
+        run(command(exe, "coordinator", model, port, "mmap", aborted, label) + options + ["--perf-details"],
             root / "gen-aborted.log", expected=1)
         verify(child.wait(timeout=15) != 0 and not aborted.with_suffix(".generated_tokens").exists()
                and not aborted.with_suffix(".generated.txt").exists(), "aborted generation published output")
+        stats = json.loads(aborted.with_suffix(".metrics.json").read_text())
+        verify(stats["status"] == "failed" and stats["tcp"]["transport_errors"] > 0 and
+               stats["stage"]["stage_execution_calls"] == 1, "missing failure diagnostics")
     print("autoregressive IDs, chunked prefill, limits, validation and failure publication verified")
 
     for nonfinite in (None, float("nan"), float("inf")):

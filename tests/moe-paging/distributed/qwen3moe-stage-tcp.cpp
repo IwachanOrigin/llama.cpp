@@ -31,6 +31,7 @@ extern "C" {
 #include <sstream>
 #include <string>
 #include <vector>
+#include "stage-perf.h"
 
 using bytes = std::vector<uint8_t>;
 using steady_clock = stage_tcp::clock;
@@ -90,8 +91,31 @@ struct channel {
     stage_tcp::socket peer;
     uint64_t sent = 0, received = 0;
     std::chrono::milliseconds frame_limit;
-    explicit channel(stage_tcp::socket socket, uint32_t frame_ms)
-        : peer(std::move(socket)), frame_limit(frame_ms) {}
+    stage_performance * perf;
+    explicit channel(stage_tcp::socket socket, uint32_t frame_ms, stage_performance * details)
+        : peer(std::move(socket)), frame_limit(frame_ms), perf(details) {}
+
+    void transfer(uint8_t * data, size_t size, bool sending, steady_clock::time_point deadline) {
+        auto & count = sending ? sent : received;
+        if (!perf) {
+            peer.transfer(data, size, sending, deadline, count);
+            return;
+        }
+        const auto start = steady_clock::now();
+        auto record = [&] {
+            (sending ? perf->send_ms : perf->receive_ms) += stage_performance::elapsed(start);
+            (sending ? perf->sent : perf->received) = count;
+        };
+        try {
+            peer.transfer(data, size, sending, deadline, count);
+        } catch (const std::exception & error) {
+            record();
+            ++perf->transport_errors;
+            if (std::strstr(error.what(), "timeout")) ++perf->timeouts;
+            throw;
+        }
+        record();
+    }
 
     void send(frame packet) {
         require(packet.body.size() <= cap, "outgoing frame too large");
@@ -100,8 +124,8 @@ struct channel {
             put(header, value);
         }
         const auto deadline = steady_clock::now() + frame_limit;
-        peer.transfer(header.data(), header.size(), true, deadline, sent);
-        peer.transfer(packet.body.data(), packet.body.size(), true, deadline, sent);
+        transfer(header.data(), header.size(), true, deadline);
+        transfer(packet.body.data(), packet.body.size(), true, deadline);
         std::fprintf(stderr, "tx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
     }
@@ -111,13 +135,13 @@ struct channel {
         const size_t starting_bytes = response_ms ? 1 : 0;
         if (response_ms) {
             try {
-                peer.transfer(header.data(), 1, false, steady_clock::now() + std::chrono::milliseconds(response_ms), received);
+                transfer(header.data(), 1, false, steady_clock::now() + std::chrono::milliseconds(response_ms));
             } catch (const std::runtime_error & error) {
                 throw std::runtime_error(std::string("awaiting Worker response: ") + error.what());
             }
         }
         const auto deadline = steady_clock::now() + frame_limit;
-        peer.transfer(header.data() + starting_bytes, header.size() - starting_bytes, false, deadline, received);
+        transfer(header.data() + starting_bytes, header.size() - starting_bytes, false, deadline);
         reader r{header};
         require(r.word() == magic, "bad protocol magic");
         require(r.word() == version, "unsupported protocol version");
@@ -126,7 +150,7 @@ struct channel {
         require(type >= hello && type <= ack, "unexpected message type");
         require(length <= cap, "invalid frame length");
         frame packet{type, r.word(), r.word(), bytes(length)};
-        peer.transfer(packet.body.data(), packet.body.size(), false, deadline, received);
+        transfer(packet.body.data(), packet.body.size(), false, deadline);
         std::fprintf(stderr, "rx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
         if (type == error_message) {
@@ -157,6 +181,8 @@ struct options {
     uint32_t max_new_tokens = 0;
     std::string prompt_file{}, system_file{}, rendered_prompt_file{};
     bool chat = false;
+    bool perf_details = false;
+    std::string perf_cache_state = "uncontrolled";
     std::vector<llama_token> prompt_tokens{};
 };
 
@@ -242,6 +268,10 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             cfg.chat = true;
             continue;
         }
+        if (key == "--perf-details") {
+            cfg.perf_details = true;
+            continue;
+        }
         require(i + 1 < argc, "option requires a value");
         const std::string value = argv[++i];
         if (key == "--prompt-file") {
@@ -252,6 +282,11 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         if (key == "--system-file" || key == "--rendered-prompt-file") {
             require(!value.empty(), "chat file path cannot be empty");
             (key == "--system-file" ? cfg.system_file : cfg.rendered_prompt_file) = value;
+            continue;
+        }
+        if (key == "--perf-cache-state") {
+            require(value == "warm" || value == "cold" || value == "uncontrolled", "invalid cache-state label");
+            cfg.perf_cache_state = value;
             continue;
         }
         if (key == "--sampling") {
@@ -350,8 +385,9 @@ struct stage {
     llama_context_ptr context;
     uint32_t begin, end;
     uint32_t hidden, vocab;
+    stage_performance * perf;
 
-    explicit stage(const options & cfg) : output(cfg.output) {
+    explicit stage(const options & cfg, stage_performance * details) : output(cfg.output), perf(details) {
         output.generation = cfg.generate;
         const bool baseline = cfg.role == "baseline";
         begin = cfg.role == "worker" ? cfg.split : 0;
@@ -362,8 +398,15 @@ struct stage {
         require(uint64_t(cfg.pager_mib) * 1048576 <= SIZE_MAX, "Pager budget exceeds address space");
         mp.external_expert_cache_size = size_t(cfg.pager_mib) * 1048576;
         mp.use_extra_bufts = false;
+        const auto load_start = perf ? steady_clock::now() : steady_clock::time_point{};
         model.reset(llama_model_load_stage(cfg.model.c_str(), mp, begin, end));
         require(bool(model) && uint32_t(llama_model_n_layer(model.get())) == cfg.layers, "stage model or layer count mismatch");
+        if (perf) {
+            perf->summary["model_load_wall_ms"] = stage_performance::elapsed(load_start);
+            perf->summary["gguf_metadata_ms"] = llama_model_metadata_load_us(model.get()) / 1000.0;
+            perf->summary["weights_load_ms"] = llama_model_weights_load_us(model.get()) / 1000.0;
+            perf->summary["layer_range"] = {begin, end};
+        }
         hidden = llama_model_n_embd(model.get());
         vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         require(hidden && vocab && 16 + uint64_t(cfg.batch) * (4 + uint64_t(hidden)*4) <= cap &&
@@ -379,8 +422,15 @@ struct stage {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.cb_eval = cfg.generate ? nullptr : artifacts::eval;
         cp.cb_eval_user_data = &output;
+        const auto context_start = perf ? steady_clock::now() : steady_clock::time_point{};
         context.reset(llama_init_from_model(model.get(), cp));
         require(bool(context), "cannot create stage context");
+        if (perf) {
+            perf->summary["context_init_ms"] = stage_performance::elapsed(context_start);
+            perf->summary["effective_context"] = llama_n_ctx(context.get());
+            perf->summary["vocab"] = vocab;
+            perf->summary["hidden"] = hidden;
+        }
         std::fprintf(stderr, "execution layers=[%u,%u) requested_ctx=%u effective_ctx=%u batch=%u threads=%u pager_budget_mib=%u\n",
                 begin, end, cfg.ctx, llama_n_ctx(context.get()), cfg.batch, cfg.threads, cfg.pager_mib);
     }
@@ -398,11 +448,18 @@ struct stage {
         return result;
     }
 
-    void compute(llama_batch batch) {
+    void compute(llama_batch batch, stage_performance::row * sample) {
+        const auto before = sample ? llama_get_pager_metrics(model.get()) : llama_pager_metrics{};
         const auto start = steady_clock::now();
         require(llama_decode(context.get(), batch) == 0, "stage decode failed");
         llama_synchronize(context.get());
         const auto ms = std::chrono::duration<double, std::milli>(steady_clock::now() - start).count();
+        if (sample) {
+            sample->execution = ms;
+            const auto after = llama_get_pager_metrics(model.get());
+            sample->pager = stage_performance::delta(after, before);
+            sample->pager_valid = true;
+        }
         std::fprintf(stderr, "compute position=%d tokens=%d ms=%.3f\n", batch.pos[0], batch.n_tokens, ms);
     }
 
@@ -440,6 +497,12 @@ struct stage {
             workspace += item.second.compute;
         }
         const auto stats = llama_get_pager_metrics(model.get());
+        if (perf) {
+            perf->summary["process_memory"] = stage_performance::process_memory();
+            perf->summary["model_memory"] = {{"ordinary_tensor_bytes", normal_bytes}, {"expert_logical_bytes", expert_bytes},
+                    {"kv_bytes", kv}, {"workspace_bytes", workspace}, {"expert_provider_count", experts}};
+            perf->summary["pager"] = stage_performance::pager_json(stats, perf->stage_stats("")["input_tokens"].get<uint64_t>());
+        }
 #ifdef _WIN32
         PROCESS_MEMORY_COUNTERS memory{};
         if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory))) {
@@ -463,6 +526,8 @@ static void acknowledge(channel & wire, message type, uint32_t session, uint32_t
 }
 
 static void worker(const options & cfg, stage & local, channel & wire, state & status, uint32_t & session, uint32_t & request) {
+    auto * perf = local.perf;
+    const auto handshake = perf ? steady_clock::now() : steady_clock::time_point{};
     auto announcement = wire.receive();
     expect(announcement, hello, 0, 0);
     require(announcement.body == local.metadata(cfg), "model or stage metadata mismatch");
@@ -472,8 +537,14 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
     if (!session) session = 1;
     status = state::active;
     wire.send({ack, session, 0, {}});
+    if (perf) {
+        perf->session = session;
+        perf->summary["handshake_wall_ms"] = stage_performance::elapsed(handshake);
+    }
     uint32_t position = 0;
     for (request = 1; ; ++request) {
+        const auto receive_before = perf ? perf->receive_ms : 0;
+        const auto bytes_before = wire.received;
         const auto packet = wire.receive();
         if (packet.kind == close_session) {
             expect(packet, close_session, session, request);
@@ -483,6 +554,7 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
             return;
         }
         expect(packet, execute_stage, session, request);
+        const auto parse_start = perf ? steady_clock::now() : steady_clock::time_point{};
         require(status == state::active, "session is not active");
         reader r{packet.body};
         const uint32_t count = r.word();
@@ -497,6 +569,14 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
             positions[i] = value;
         }
         auto activation = floats(r, count, local.hidden);
+        stage_performance::row * sample = nullptr;
+        if (perf) {
+            perf->rows.push_back({"", request, position, count});
+            sample = &perf->rows.back();
+            sample->deserialize = stage_performance::elapsed(parse_start);
+            sample->receive = perf->receive_ms - receive_before;
+            sample->received = wire.received - bytes_before;
+        }
         if (cfg.fault == "after-receive") throw std::runtime_error("injected disconnect after receive");
         std::vector<int8_t> outputs(count, 1);
         llama_batch batch{};
@@ -504,14 +584,22 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         batch.embd = activation.data();
         batch.pos = positions.data();
         batch.logits = outputs.data();
-        local.compute(batch);
+        local.compute(batch, sample);
         if (cfg.fault == "after-decode") throw std::runtime_error("injected disconnect after decode");
+        const auto encode_start = sample ? steady_clock::now() : steady_clock::time_point{};
         bytes result;
         put(result, 0);
         put(result, count);
         put(result, local.vocab);
         local.logits(result, count);
+        if (sample) sample->serialize = stage_performance::elapsed(encode_start);
+        const auto send_before = perf ? perf->send_ms : 0;
+        const auto sent_before = wire.sent;
         wire.send({stage_result, session, request, std::move(result)});
+        if (sample) {
+            sample->send = perf->send_ms - send_before;
+            sample->sent = wire.sent - sent_before;
+        }
         position += count;
     }
 }
@@ -658,6 +746,8 @@ static std::string generation_text(const llama_vocab * vocab, const std::vector<
 
 static void coordinator(const options & cfg, stage & local, channel * wire, state & status,
                         uint32_t & session, uint32_t & request) {
+    auto * perf = local.perf;
+    const auto handshake = perf ? steady_clock::now() : steady_clock::time_point{};
     if (wire) {
         const auto metadata = local.metadata(cfg);
         wire->send({hello, 0, 0, metadata});
@@ -669,23 +759,47 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         require(ready.session != 0 && ready.body.empty(), "invalid session acknowledgement");
         expect(ready, ack, ready.session, 0);
         session = ready.session;
+        if (perf) {
+            perf->session = session;
+            perf->summary["handshake_wall_ms"] = stage_performance::elapsed(handshake);
+        }
     }
     status = state::active;
     const auto * vocab = llama_model_get_vocab(local.model.get());
+    const auto prepare_start = perf ? steady_clock::now() : steady_clock::time_point{};
     auto tokens = cfg.generate ? generation_prompt(cfg, local.model.get(), vocab) : cfg.tokens;
+    if (perf) {
+        perf->summary["prompt_preprocess_ms"] = stage_performance::elapsed(prepare_start);
+        perf->summary["prompt_tokens"] = tokens.size();
+        bytes encoded;
+        for (auto token : tokens) put(encoded, uint32_t(token));
+        uint8_t digest[SHA256_DIGEST_SIZE];
+        sha256_hash(digest, encoded.data(), encoded.size());
+        std::ostringstream fingerprint;
+        for (auto value : digest) fingerprint << std::hex << std::setw(2) << std::setfill('0') << unsigned(value);
+        perf->summary["prompt_token_sha256"] = fingerprint.str();
+    }
     const uint32_t context_limit = std::min(cfg.ctx, llama_n_ctx(local.context.get()));
     require(tokens.size() <= context_limit &&
             std::all_of(tokens.begin(), tokens.end(), [&](llama_token id) { return uint32_t(id) < local.vocab; }),
             "prompt tokens exceed context or vocabulary");
     request = 1;
-    auto evaluate = [&](llama_token * input, uint32_t offset, uint32_t count) {
+    double extra_decode_wall_ms = 0;
+    uint32_t decode_steps = 0;
+    auto evaluate = [&](llama_token * input, uint32_t offset, uint32_t count, const char * phase) {
+        const auto evaluation_start = perf ? steady_clock::now() : steady_clock::time_point{};
+        stage_performance::row * sample = nullptr;
+        if (perf) {
+            perf->rows.push_back({phase, request, offset, count});
+            sample = &perf->rows.back();
+        }
         std::vector<llama_pos> positions(count);
         for (uint32_t i = 0; i < count; ++i) positions[i] = offset + i;
         std::vector<int8_t> outputs(count, 1);
         auto batch = llama_batch_get_one(input, count);
         batch.pos = positions.data();
         batch.logits = outputs.data();
-        local.compute(batch);
+        local.compute(batch, sample);
         std::vector<float> last;
         if (!wire) {
             if (cfg.generate) {
@@ -696,6 +810,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
                 local.logits(local.output.logits, count);
             }
         } else {
+            const auto encode_start = sample ? steady_clock::now() : steady_clock::time_point{};
             bytes activation;
             for (auto field : {count, local.hidden, 0u, wire_f32}) put(activation, field);
             for (auto position : positions) put(activation, position);
@@ -706,10 +821,23 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
             if (!cfg.generate) {
                 local.output.boundary.insert(local.output.boundary.end(), activation.begin() + data_offset, activation.end());
             }
+            if (sample) sample->serialize = stage_performance::elapsed(encode_start);
+            const auto send_before = perf ? perf->send_ms : 0;
+            const auto receive_before = perf ? perf->receive_ms : 0;
+            const auto sent_before = wire->sent;
+            const auto received_before = wire->received;
             const auto start = steady_clock::now();
             wire->send({execute_stage, session, request, std::move(activation)});
             const auto result = wire->receive(cfg.response_ms);
             const auto ms = std::chrono::duration<double, std::milli>(steady_clock::now() - start).count();
+            if (sample) {
+                sample->roundtrip = ms;
+                sample->send = perf->send_ms - send_before;
+                sample->receive = perf->receive_ms - receive_before;
+                sample->sent = wire->sent - sent_before;
+                sample->received = wire->received - received_before;
+            }
+            const auto parse_start = sample ? steady_clock::now() : steady_clock::time_point{};
             expect(result, stage_result, session, request);
             reader r{result.body};
             require(r.word() == 0 && r.word() == count && r.word() == local.vocab, "invalid output shape or status");
@@ -720,17 +848,21 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
                 local.output.logits.insert(local.output.logits.end(), result.body.begin() + 12, result.body.end());
             }
             std::fprintf(stderr, "roundtrip request=%u tokens=%u ms=%.3f\n", request, count, ms);
+            if (sample) sample->deserialize = stage_performance::elapsed(parse_start);
         }
         ++request;
+        if (perf && std::strcmp(phase, "decode") == 0) extra_decode_wall_ms += stage_performance::elapsed(evaluation_start);
         return last;
     };
     const auto prefill_start = steady_clock::now();
     std::vector<float> last;
+    uint32_t prefill_batches = 0;
     for (uint32_t offset = 0; offset < tokens.size();) {
         const uint32_t count = cfg.generate ? std::min<uint32_t>(cfg.batch, tokens.size() - offset) :
             (offset == 0 ? cfg.prefill : 1);
-        last = evaluate(tokens.data() + offset, offset, count);
+        last = evaluate(tokens.data() + offset, offset, count, cfg.generate ? "prefill" : "fixed");
         offset += count;
+        ++prefill_batches;
     }
     if (cfg.generate) {
         const auto decode_start = steady_clock::now();
@@ -738,21 +870,43 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         std::vector<llama_token> generated;
         uint32_t next_position = tokens.size();
         const char * reason = "limit";
+        double selection_ms = 0, first_selection_ms = 0, stop_check_ms = 0;
         for (uint32_t step = 0; step < cfg.max_new_tokens; ++step) {
+            const auto selection_start = perf ? steady_clock::now() : steady_clock::time_point{};
             auto token = greedy(last);
+            if (perf) {
+                const double duration = stage_performance::elapsed(selection_start);
+                selection_ms += duration;
+                if (step == 0) first_selection_ms = duration;
+            }
             generated.push_back(token);
-            if (llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE && llama_vocab_is_eog(vocab, token)) {
-                reason = "eog";
+            const auto stop_start = perf ? steady_clock::now() : steady_clock::time_point{};
+            const char * stop = nullptr;
+            if (llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE && llama_vocab_is_eog(vocab, token)) stop = "eog";
+            else if (step + 1 == cfg.max_new_tokens) stop = "limit";
+            else if (next_position == context_limit) stop = "context";
+            if (perf) stop_check_ms += stage_performance::elapsed(stop_start);
+            if (stop) {
+                reason = stop;
                 break;
             }
-            if (step + 1 == cfg.max_new_tokens) break;
-            if (next_position == context_limit) {
-                reason = "context";
-                break;
-            }
-            last = evaluate(&token, next_position++, 1);
+            last = evaluate(&token, next_position++, 1, "decode");
+            ++decode_steps;
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(steady_clock::now() - decode_start).count();
+        if (perf) {
+            perf->summary["generation"] = {{"generated_tokens", generated.size()}, {"stop", reason},
+                {"prefill_batches", prefill_batches}, {"prefill_ms", prefill_ms},
+                {"prefill_tokens_per_sec", 1000 * tokens.size() / prefill_ms},
+                {"generation_loop_ms", decode_ms}, {"decode_steps", decode_steps},
+                {"decode_step_wall_ms", extra_decode_wall_ms},
+                {"decode_tokens_per_sec", decode_steps && extra_decode_wall_ms > 0 ?
+                        stage_performance::json(1000 * decode_steps / extra_decode_wall_ms) : stage_performance::json(nullptr)},
+                {"generation_elapsed_ms", prefill_ms + decode_ms},
+                {"generation_tokens_per_sec", 1000 * generated.size() / (prefill_ms + decode_ms)},
+                {"greedy_ms", selection_ms}, {"first_selection_ms", first_selection_ms},
+                {"stop_check_ms", stop_check_ms}};
+        }
         local.output.generated_text = generation_text(vocab, generated);
         for (auto token : generated) put(local.output.generated_tokens, uint32_t(token));
         std::fprintf(stderr, "generation prompt_tokens=%zu generated_tokens=%zu stop=%s prefill_ms=%.3f "
@@ -768,6 +922,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
 }
 
 int main(int argc, char ** argv) {
+    std::unique_ptr<stage_performance> perf;
     try {
         require(argc >= 8,
                 "usage: qwen3moe-stage-tcp ROLE MODEL SPLIT LAYERS PORT mmap|buffered OUTPUT_PREFIX [auto|SHA256|-] [OPTIONS]");
@@ -795,10 +950,32 @@ int main(int argc, char ** argv) {
                 cfg.identity.find_first_not_of("0123456789abcdef") == std::string::npos), "invalid SHA256 label");
         require(cfg.fault.empty() || (cfg.role == "worker" &&
                 (cfg.fault == "after-receive" || cfg.fault == "after-decode")), "invalid test fault option");
+        if (cfg.perf_details) {
+            for (const char * suffix : {".metrics.json", ".perf.csv"}) {
+                require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + suffix)),
+                        "use a fresh performance output prefix");
+            }
+            perf = std::make_unique<stage_performance>();
+            perf->prefix = cfg.output;
+            perf->summary = {{"role", cfg.role}, {"revision", STAGE_BUILD_COMMIT}, {"version", llama_version()},
+                {"model_path", cfg.model}, {"identity_source", cfg.auto_identity ? "local-sha256" :
+                        cfg.identity.empty() ? "metadata" : "label"},
+                {"split", cfg.split}, {"layers", cfg.layers}, {"context", cfg.ctx}, {"batch", cfg.batch},
+                {"threads", cfg.threads}, {"pager_budget_mib", cfg.pager_mib}, {"io", cfg.io},
+                {"cache_state_label", cfg.perf_cache_state}, {"chat", cfg.role == "worker" ?
+                        stage_performance::json(nullptr) : stage_performance::json(cfg.chat)},
+                {"max_new_tokens", cfg.role == "worker" ? stage_performance::json(nullptr) :
+                        stage_performance::json(cfg.max_new_tokens)}};
+        }
         ggml_backend_load_all();
         const auto hash_start = steady_clock::now();
         if (cfg.auto_identity) cfg.identity = model_identity(cfg.model);
         const auto hash_ms = std::chrono::duration<double, std::milli>(steady_clock::now() - hash_start).count();
+        if (perf) {
+            perf->summary["hash_ms"] = cfg.auto_identity ? stage_performance::json(hash_ms) : stage_performance::json(nullptr);
+            perf->summary["model_identity"] = cfg.identity.empty() ? stage_performance::json(nullptr) :
+                    stage_performance::json(cfg.identity);
+        }
 #ifdef _WIN32
         SYSTEM_INFO machine{};
         GetNativeSystemInfo(&machine);
@@ -807,45 +984,62 @@ int main(int argc, char ** argv) {
         const auto query = reinterpret_cast<machine_info>(reinterpret_cast<void (*)()>(
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2")));
         if (query) query(GetCurrentProcess(), &process_machine, &native_machine);
+        if (perf) perf->summary["host"] = {{"os", "Windows"}, {"native_machine", native_machine},
+                                           {"pid", GetCurrentProcessId()}};
         std::fprintf(stderr, "os=Windows native_machine=0x%x reported_arch=%u pid=%lu\n",
                 unsigned(native_machine), unsigned(machine.wProcessorArchitecture), (unsigned long) GetCurrentProcessId());
 #else
+        if (perf) perf->summary["host"] = {{"os", "Linux"}, {"pid", getpid()}};
         std::fprintf(stderr, "os=Linux pid=%ld\n", (long) getpid());
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
+        if (perf) perf->summary["binary_arch"] = "x86_64";
         std::fprintf(stderr, "binary_arch=x86_64\n");
 #elif defined(__aarch64__) || defined(_M_ARM64)
+        if (perf) perf->summary["binary_arch"] = "arm64";
         std::fprintf(stderr, "binary_arch=arm64\n");
 #endif
         std::fprintf(stderr, "build=%s revision=%s identity=%s identity_source=%s hash_ms=%.3f role=%s\n",
                 llama_version(), STAGE_BUILD_COMMIT, cfg.identity.empty() ? "-" : cfg.identity.c_str(),
                 cfg.auto_identity ? "local-sha256" : cfg.identity.empty() ? "metadata" : "label",
                 hash_ms, cfg.role.c_str());
-        stage local(cfg);
+        stage local(cfg, perf.get());
         state status = state::created;
         uint32_t session = 0, request = 0;
         if (cfg.role == "baseline") {
             coordinator(cfg, local, nullptr, status, session, request);
         } else {
+            const auto connect_start = perf ? steady_clock::now() : steady_clock::time_point{};
             stage_tcp::runtime sockets;
             auto peer = [&] {
-                if (cfg.role == "coordinator") {
-                    require(cfg.port > 0, "coordinator requires a worker port");
-                    return stage_tcp::connect(uint16_t(cfg.port), std::chrono::milliseconds(cfg.connect_ms));
+                try {
+                    if (cfg.role == "coordinator") {
+                        require(cfg.port > 0, "coordinator requires a worker port");
+                        return stage_tcp::connect(uint16_t(cfg.port), std::chrono::milliseconds(cfg.connect_ms));
+                    }
+                    stage_tcp::socket listener;
+                    const auto port = stage_tcp::listen(listener, uint16_t(cfg.port));
+                    std::printf("READY %u\n", port);
+                    std::fflush(stdout);
+                    return stage_tcp::accept(listener, std::chrono::milliseconds(cfg.accept_ms));
+                } catch (const std::exception & error) {
+                    if (perf) {
+                        ++perf->transport_errors;
+                        if (std::strstr(error.what(), "timeout")) ++perf->timeouts;
+                    }
+                    throw;
                 }
-                stage_tcp::socket listener;
-                const auto port = stage_tcp::listen(listener, uint16_t(cfg.port));
-                std::printf("READY %u\n", port);
-                std::fflush(stdout);
-                return stage_tcp::accept(listener, std::chrono::milliseconds(cfg.accept_ms));
             }();
-            channel wire(std::move(peer), cfg.frame_ms);
+            if (perf) perf->summary[cfg.role == "worker" ? "accept_wall_ms" : "connect_wall_ms"] =
+                    stage_performance::elapsed(connect_start);
+            channel wire(std::move(peer), cfg.frame_ms, perf.get());
             status = state::ready;
             try {
                 if (cfg.role == "worker") worker(cfg, local, wire, status, session, request);
                 else coordinator(cfg, local, &wire, status, session, request);
             } catch (const std::exception & error) {
                 status = state::failed;
+                if (perf) ++perf->session_errors;
                 if (cfg.fault.empty()) {
                     const std::string what = error.what();
                     try { wire.send({error_message, session, request, bytes(what.begin(), what.end())}); }
@@ -857,9 +1051,16 @@ int main(int argc, char ** argv) {
         require(status == state::closed, "session did not close");
         local.report();
         local.output.save();
+        if (perf) perf->save(true);
         std::fprintf(stderr, "CLOSED\n");
         return 0;
     } catch (const std::exception & error) {
+        if (perf) {
+            try { perf->save(false, error.what()); }
+            catch (const std::exception & write_error) {
+                std::fprintf(stderr, "cannot save performance metrics: %s\n", write_error.what());
+            }
+        }
         std::fprintf(stderr, "FAILED: %s\n", error.what());
         return 1;
     }

@@ -11,6 +11,8 @@ moe-paging/distributed/*
 !moe-paging/distributed/*.md
 !moe-paging/distributed/*.cpp
 !moe-paging/distributed/stage-tcp.h
+!moe-paging/distributed/stage-perf.h
+!moe-paging/distributed/analyze-stage-performance.py
 !moe-paging/distributed/test-stage-tcp.py
 !moe-paging/distributed/prepare-stage-fixture.py
 !moe-paging/*.cpp
