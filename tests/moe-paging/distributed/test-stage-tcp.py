@@ -271,6 +271,17 @@ def generation(exe, model, root, label):
            summaries[0]["stage"]["stage_execution_min_ms"] <= summaries[0]["stage"]["stage_execution_avg_ms"] <=
            summaries[0]["stage"]["stage_execution_max_ms"], "profile aggregate is inconsistent")
     verify(phases["decode"]["worker_reads"] > 0, "worker Pager counters were not recorded")
+    traced = root / "trace-baseline"
+    run(command(exe, "baseline", model, 0, "mmap", traced, label) + options +
+        ["--expert-trace-limit", "10000"], root / "trace-baseline.log")
+    verify(traced.with_suffix(".generated_tokens").read_bytes() == a and
+           traced.with_suffix(".generated.txt").read_bytes() == baseline.with_suffix(".generated.txt").read_bytes(),
+           "Expert tracing changed generation")
+    capacity_tools = runpy.run_path(str(Path(__file__).with_name("analyze-pager-capacity.py")))
+    trace = capacity_tools["diagnose"](traced.with_suffix(".experts.jsonl"), None)
+    verify(len(trace["requests"]) == 5 and trace["trace_metadata"]["dropped"] == 0 and
+           sum(row["hits"] + row["misses"] for row in trace["requests"]) == trace["trace_metadata"]["events"],
+           "Expert trace requests do not reconcile")
     with profiled.with_suffix(".perf.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     verify(len(rows) == 5 and all(row["receive_bytes"] == "" for row in rows) and

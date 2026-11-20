@@ -32,6 +32,7 @@ extern "C" {
 #include <string>
 #include <vector>
 #include "stage-perf.h"
+#include "stage-expert-trace.h"
 
 using bytes = std::vector<uint8_t>;
 using steady_clock = stage_tcp::clock;
@@ -182,6 +183,7 @@ struct options {
     std::string prompt_file{}, system_file{}, rendered_prompt_file{};
     bool chat = false;
     bool perf_details = false;
+    uint32_t expert_trace_limit = 0;
     std::string perf_cache_state = "uncontrolled";
     std::vector<llama_token> prompt_tokens{};
 };
@@ -314,6 +316,7 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         else if (key == "--batch") cfg.batch = n;
         else if (key == "--threads") cfg.threads = n;
         else if (key == "--pager-budget-mib") cfg.pager_mib = n;
+        else if (key == "--expert-trace-limit") cfg.expert_trace_limit = n;
         else if (key == "--prefill") {
             cfg.prefill = n;
             cfg.fixed_input_set = true;
@@ -381,6 +384,7 @@ struct artifacts {
 
 struct stage {
     artifacts output;
+    std::unique_ptr<stage_expert_trace> trace;
     llama_model_ptr model;
     llama_context_ptr context;
     uint32_t begin, end;
@@ -425,6 +429,11 @@ struct stage {
         const auto context_start = perf ? steady_clock::now() : steady_clock::time_point{};
         context.reset(llama_init_from_model(model.get(), cp));
         require(bool(context), "cannot create stage context");
+        if (cfg.expert_trace_limit) {
+            trace = std::make_unique<stage_expert_trace>();
+            trace->events.resize(cfg.expert_trace_limit);
+            llama_set_pager_trace(model.get(), stage_expert_trace::capture, trace.get());
+        }
         if (perf) {
             perf->summary["context_init_ms"] = stage_performance::elapsed(context_start);
             perf->summary["effective_context"] = llama_n_ctx(context.get());
@@ -448,7 +457,9 @@ struct stage {
         return result;
     }
 
-    void compute(llama_batch batch, stage_performance::row * sample) {
+    void compute(llama_batch batch, stage_performance::row * sample, uint32_t request, const char * phase) {
+        const size_t trace_begin = trace ? trace->seen : 0;
+        if (trace) trace->decoding = std::strcmp(phase, "decode") == 0;
         const auto before = sample ? llama_get_pager_metrics(model.get()) : llama_pager_metrics{};
         const auto start = steady_clock::now();
         require(llama_decode(context.get(), batch) == 0, "stage decode failed");
@@ -459,6 +470,10 @@ struct stage {
             const auto after = llama_get_pager_metrics(model.get());
             sample->pager = stage_performance::delta(after, before);
             sample->pager_valid = true;
+        }
+        if (trace) {
+            trace->requests.push_back({{"request_id", request}, {"position", batch.pos[0]},
+                {"token_count", batch.n_tokens}, {"begin", trace_begin}, {"end", trace->seen}, {"phase", phase}});
         }
         std::fprintf(stderr, "compute position=%d tokens=%d ms=%.3f\n", batch.pos[0], batch.n_tokens, ms);
     }
@@ -584,7 +599,7 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         batch.embd = activation.data();
         batch.pos = positions.data();
         batch.logits = outputs.data();
-        local.compute(batch, sample);
+        local.compute(batch, sample, request, "");
         if (cfg.fault == "after-decode") throw std::runtime_error("injected disconnect after decode");
         const auto encode_start = sample ? steady_clock::now() : steady_clock::time_point{};
         bytes result;
@@ -799,7 +814,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         auto batch = llama_batch_get_one(input, count);
         batch.pos = positions.data();
         batch.logits = outputs.data();
-        local.compute(batch, sample);
+        local.compute(batch, sample, request, phase);
         std::vector<float> last;
         if (!wire) {
             if (cfg.generate) {
@@ -967,6 +982,11 @@ int main(int argc, char ** argv) {
                 {"max_new_tokens", cfg.role == "worker" ? stage_performance::json(nullptr) :
                         stage_performance::json(cfg.max_new_tokens)}};
         }
+        if (cfg.expert_trace_limit) {
+            require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + ".experts.jsonl")),
+                    "use a fresh Expert trace output prefix");
+            if (perf) perf->summary["expert_trace_limit"] = cfg.expert_trace_limit;
+        }
         ggml_backend_load_all();
         const auto hash_start = steady_clock::now();
         if (cfg.auto_identity) cfg.identity = model_identity(cfg.model);
@@ -1051,6 +1071,7 @@ int main(int argc, char ** argv) {
         require(status == state::closed, "session did not close");
         local.report();
         local.output.save();
+        if (local.trace) local.trace->save(cfg.output, cfg.role, local.model.get());
         if (perf) perf->save(true);
         std::fprintf(stderr, "CLOSED\n");
         return 0;
