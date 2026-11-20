@@ -422,6 +422,7 @@ if (GGML_CPU AND LLAMA_BUILD_TOOLS AND NOT CMAKE_CROSSCOMPILING AND NOT EMSCRIPT
         set_tests_properties(test-qwen3moe-stage PROPERTIES LABELS behavior TIMEOUT 120)
         if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
             llama_build(moe-paging/distributed/qwen3moe-stage-tcp.cpp LINK llama ggml Threads::Threads)
+            target_link_libraries(qwen3moe-stage-tcp PRIVATE llama-common)
             target_include_directories(qwen3moe-stage-tcp PRIVATE ../src ../ggml/src)
             target_sources(qwen3moe-stage-tcp PRIVATE ../vendor/hash/sha256/sha256.c)
             target_include_directories(qwen3moe-stage-tcp PRIVATE ../vendor/hash ../vendor/hash/sha256)

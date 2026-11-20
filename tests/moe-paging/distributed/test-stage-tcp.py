@@ -256,6 +256,13 @@ def generation(exe, model, root, label):
                    ["--generate", "--prompt-file", str(prompt), "--max-new-tokens", "1"],
                    root / "no-tokenizer.log", expected=1)
     verify("model has no tokenizer" in rejected, "missing tokenizer was accepted")
+    chat_args = ["--generate", "--chat", "--prompt-file", str(prompt), "--max-new-tokens", "1"]
+    rejected = run(command(exe, "baseline", model, 0, "mmap", root / "no-chat-template", label) +
+                   chat_args, root / "no-chat-template.log", expected=1)
+    verify("GGUF has no default chat template" in rejected, "missing chat template was accepted")
+    rejected = run(command(exe, "baseline", model, 0, "mmap", root / "wrong-chat-mode", label) +
+                   ["--system-file", str(prompt)], root / "wrong-chat-mode.log", expected=1)
+    verify("chat file options require --chat" in rejected, "system input was silently ignored")
     rejected = run(command(exe, "baseline", model, 0, "mmap", root / "mixed-mode", label) +
                    options + ["--tokens", "1,2"], root / "mixed-mode.log", expected=1)
     verify("cannot be combined" in rejected, "mixed generation and fixed input were accepted")

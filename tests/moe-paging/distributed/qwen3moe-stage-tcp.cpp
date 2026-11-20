@@ -5,6 +5,8 @@
 #include "llama-cpp.h"
 #include "llama-ext.h"
 #include "llama-model.h"
+#include "chat.h"
+#include "common.h"
 
 extern "C" {
 #include "sha256.h"
@@ -153,7 +155,8 @@ struct options {
     std::vector<llama_token> tokens{1, 19, 7, 42, 51};
     bool generate = false, fixed_input_set = false;
     uint32_t max_new_tokens = 0;
-    std::string prompt_file{};
+    std::string prompt_file{}, system_file{}, rendered_prompt_file{};
+    bool chat = false;
     std::vector<llama_token> prompt_tokens{};
 };
 
@@ -235,11 +238,20 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             cfg.generate = true;
             continue;
         }
+        if (key == "--chat") {
+            cfg.chat = true;
+            continue;
+        }
         require(i + 1 < argc, "option requires a value");
         const std::string value = argv[++i];
         if (key == "--prompt-file") {
             require(!value.empty(), "prompt path cannot be empty");
             cfg.prompt_file = value;
+            continue;
+        }
+        if (key == "--system-file" || key == "--rendered-prompt-file") {
+            require(!value.empty(), "chat file path cannot be empty");
+            (key == "--system-file" ? cfg.system_file : cfg.rendered_prompt_file) = value;
             continue;
         }
         if (key == "--sampling") {
@@ -529,10 +541,8 @@ static std::string checked_utf8(const std::string & input, bool replace) {
     return output;
 }
 
-static std::vector<llama_token> generation_prompt(const options & cfg, const llama_vocab * vocab) {
-    if (!cfg.prompt_tokens.empty()) return cfg.prompt_tokens;
-    require(llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE, "model has no tokenizer");
-    std::ifstream file(std::filesystem::u8path(cfg.prompt_file), std::ios::binary | std::ios::ate);
+static std::string read_prompt_text(const std::string & path) {
+    std::ifstream file(std::filesystem::u8path(path), std::ios::binary | std::ios::ate);
     require(bool(file), "cannot open prompt file");
     const auto length = file.tellg();
     require(length > 0 && length <= 16 * 1024 * 1024, "prompt file must contain 1 to 16 MiB of UTF-8 data");
@@ -542,6 +552,78 @@ static std::vector<llama_token> generation_prompt(const options & cfg, const lla
     if (text.compare(0, 3, "\xef\xbb\xbf") == 0) text.erase(0, 3);
     require(!text.empty(), "empty prompt");
     checked_utf8(text, false);
+    return text;
+}
+
+static std::vector<llama_token> chat_prompt(const options & cfg, const llama_model * model,
+                                           const llama_vocab * vocab) {
+    const char * source = llama_model_chat_template(model, nullptr);
+    require(source && *source, "GGUF has no default chat template");
+    require(llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE, "model has no tokenizer");
+    common_chat_templates_inputs inputs;
+    inputs.use_jinja = true;
+    inputs.add_generation_prompt = true;
+    auto append = [&](const char * role, const std::string & path) {
+        common_chat_msg message;
+        message.role = role;
+        message.content = read_prompt_text(path);
+        require(message.content.find_first_not_of(" \t\r\n") != std::string::npos, "empty chat message");
+        inputs.messages.push_back(std::move(message));
+    };
+    if (!cfg.system_file.empty()) append("system", cfg.system_file);
+    append("user", cfg.prompt_file);
+    common_chat_params rendered;
+    try {
+        const auto templates = common_chat_templates_init(model, source);
+        require(common_chat_templates_source(templates.get()) == source, "unexpected template substitution");
+        rendered = common_chat_templates_apply(templates.get(), inputs);
+    } catch (const std::exception &) {
+        throw std::runtime_error("unsupported or invalid GGUF chat template");
+    }
+    require(!rendered.generation_prompt.empty(), "GGUF chat template did not emit an Assistant generation prompt");
+    std::vector<llama_token> tokens;
+    // Preserve full-prompt BPE unless a literal special spelling needs a protected span.
+    bool protected_input = false;
+    for (const auto & part : rendered.prompt.parts) {
+        if (part.is_input && common_tokenize(vocab, part.text, false, true) !=
+                common_tokenize(vocab, part.text, false, false)) {
+            protected_input = true;
+        }
+    }
+    const auto text = rendered.prompt.str();
+    if (protected_input) {
+        for (const auto & part : rendered.prompt.parts) {
+            const auto chunk = common_tokenize(vocab, part.text, false, !part.is_input);
+            tokens.insert(tokens.end(), chunk.begin(), chunk.end());
+        }
+    } else {
+        tokens = common_tokenize(vocab, text, false, true);
+    }
+    // The Jinja renderer strips configured outer BOS/EOS. Add only the leading BOS for generation.
+    const auto bos = llama_vocab_bos(vocab);
+    if (llama_vocab_get_add_bos(vocab) && bos != LLAMA_TOKEN_NULL && (tokens.empty() || tokens.front() != bos)) {
+        tokens.insert(tokens.begin(), bos);
+    }
+    if (!cfg.rendered_prompt_file.empty()) {
+        const auto path = std::filesystem::u8path(cfg.rendered_prompt_file);
+        require(!std::filesystem::exists(path), "use a new rendered prompt path");
+        std::ofstream file(path, std::ios::binary);
+        require(bool(file.write(text.data(), text.size())), "cannot write rendered prompt");
+        file.close();
+        require(bool(file), "cannot close rendered prompt file");
+    }
+    std::fprintf(stderr, "chat_enabled=true chat_template_source=gguf chat_template_supports_thinking=%s "
+            "protected_input=%s\n", rendered.supports_thinking ? "true" : "false", protected_input ? "true" : "false");
+    return tokens;
+}
+
+static std::vector<llama_token> generation_prompt(const options & cfg, const llama_model * model,
+                                                  const llama_vocab * vocab) {
+    if (cfg.chat) return chat_prompt(cfg, model, vocab);
+    std::fprintf(stderr, "chat_enabled=false chat_template_source=none\n");
+    if (!cfg.prompt_tokens.empty()) return cfg.prompt_tokens;
+    require(llama_vocab_type(vocab) != LLAMA_VOCAB_TYPE_NONE, "model has no tokenizer");
+    const auto text = read_prompt_text(cfg.prompt_file);
     const int capacity = llama_tokenize(vocab, text.data(), text.size(), nullptr, 0, true, false);
     require(capacity < 0 && capacity != INT32_MIN, "cannot size prompt tokens");
     std::vector<llama_token> tokens(-capacity);
@@ -590,7 +672,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
     }
     status = state::active;
     const auto * vocab = llama_model_get_vocab(local.model.get());
-    auto tokens = cfg.generate ? generation_prompt(cfg, vocab) : cfg.tokens;
+    auto tokens = cfg.generate ? generation_prompt(cfg, local.model.get(), vocab) : cfg.tokens;
     const uint32_t context_limit = std::min(cfg.ctx, llama_n_ctx(local.context.get()));
     require(tokens.size() <= context_limit &&
             std::all_of(tokens.begin(), tokens.end(), [&](llama_token id) { return uint32_t(id) < local.vocab; }),
@@ -692,6 +774,9 @@ int main(int argc, char ** argv) {
         options cfg{argv[1], argv[2], argv[6], argv[7], "", "",
             number(argv[5], 65535), number(argv[3], 65535), number(argv[4], 65535)};
         parse_options(cfg, argc, argv);
+        require(cfg.chat ? cfg.generate && !cfg.prompt_file.empty() :
+                cfg.system_file.empty() && cfg.rendered_prompt_file.empty(),
+                "--chat requires --generate and --prompt-file; chat file options require --chat");
         require(cfg.role == "worker" || cfg.role == "coordinator" || cfg.role == "baseline", "invalid role");
         require(!cfg.generate ? (cfg.prompt_file.empty() && cfg.prompt_tokens.empty() && !cfg.max_new_tokens) :
                 (cfg.role != "worker" && !cfg.fixed_input_set && cfg.max_new_tokens &&
