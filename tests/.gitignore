@@ -14,6 +14,8 @@ moe-paging/distributed/*
 !moe-paging/distributed/stage-perf.h
 !moe-paging/distributed/stage-expert-trace.h
 !moe-paging/distributed/analyze-pager-capacity.py
+!moe-paging/distributed/simulate-pager-policies.py
+!moe-paging/distributed/test-pager-policies.py
 !moe-paging/distributed/analyze-stage-performance.py
 !moe-paging/distributed/test-stage-tcp.py
 !moe-paging/distributed/prepare-stage-fixture.py
