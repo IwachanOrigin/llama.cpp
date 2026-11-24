@@ -43,14 +43,18 @@ def compare_folders(folders):
             if reference is None:
                 reference, outputs = measured, hashes
             capacity = base["pager_budget_mib"]
-            record.update(status="ok", budget_mib=capacity, byte_match=True, output_sha256=hashes)
+            record.update(status="ok", pager_policy=base["pager_policy"], budget_mib=capacity, byte_match=True, output_sha256=hashes)
             for data in values:
                 pager, memory, generation = data["pager"], data.get("process_memory") or {}, data.get("generation", {})
-                grouped[capacity, data["role"]].append({
+                grouped[base["pager_policy"], capacity, data["role"]].append({
                     **{key: generation.get(key) for key in
                        ("prefill_ms", "decode_step_wall_ms", "generation_elapsed_ms", "generation_tokens_per_sec")},
                     **{key: pager[key] for key in ("cache_hits", "cache_misses", "cache_evictions", "hit_rate",
                                                    "disk_reads", "bytes_read", "io_wait_ns", "peak_allocated_bytes", "slots")},
+                    **{key: pager.get(key) for key in (
+                        "resident_slots", "transient_slots", "sketch_bytes", "policy_management_bytes",
+                        "admitted_misses", "bypassed_misses", "admission_comparisons", "admission_rejections",
+                        "frequency_updates", "frequency_aging_count", "transient_waits", "transient_wait_ns")},
                     **{key: memory.get(key) for key in ("peak_working_set_bytes", "private_commit_bytes", "peak_rss_bytes")},
                     "stage_execution_wall_ms": data["stage"]["stage_execution_wall_ms"],
                     **{phase + "_reads": phases[phase]["worker_reads"] if data["role"] == "worker"
@@ -59,27 +63,35 @@ def compare_folders(folders):
         except (OSError, ValueError, KeyError, TypeError) as error:
             record.update(status="excluded", reason=str(error))
     result = {}
-    for (capacity, role), samples in sorted(grouped.items()):
+    for (policy, capacity, role), samples in sorted(grouped.items()):
         fields = {}
         for key in samples[0]:
             items = [sample[key] for sample in samples if sample[key] is not None]
             fields[key] = {"median": statistics.median(items), "min": min(items), "max": max(items)} if items else None
-        result.setdefault(capacity, {})[role] = {"runs": len(samples), "metrics": fields}
-    if result:
-        smallest = min(result)
-        for capacity, roles in result.items():
+        result.setdefault(policy, {}).setdefault(capacity, {})[role] = {"runs": len(samples), "metrics": fields}
+    def delta(metrics, reference):
+        return {key: value["median"] - reference[key]["median"] if value and reference.get(key) else None
+                for key, value in metrics.items()}
+
+    lru = result.get("lru", {})
+    for budgets in result.values():
+        smallest = min(budgets)
+        for capacity, roles in budgets.items():
             for role, group in roles.items():
-                base = result[smallest][role]["metrics"]
-                group["delta_vs_smallest_budget"] = {
-                    key: value["median"] - base[key]["median"] if value and base[key] else None
-                    for key, value in group["metrics"].items()}
+                metrics = group["metrics"]
+                group["delta_vs_smallest_budget"] = delta(metrics, budgets[smallest][role]["metrics"])
+                for baseline, suffix in ((capacity, "same_budget_lru"), (768, "768_mib_lru")):
+                    if baseline in lru and role in lru[baseline]:
+                        group["delta_vs_" + suffix] = delta(metrics, lru[baseline][role]["metrics"])
     return {"conditions": reference, "model_identity_note": "Label is not independent verification." if reference and
-            reference["identity_source"] != "local-sha256" else None, "ordered_runs": ordered, "by_budget_mib": result}
+            reference["identity_source"] != "local-sha256" else None, "ordered_runs": ordered, "by_budget_mib": result.get("lru", {}), "by_policy": result}
 
 
 def diagnose(path, coordinator_csv, additional_slots=()):
     tools = runpy.run_path(str(HERE.parent / "analyze-expert-trace.py"))
     header, rows = tools["read_trace"](path)
+    if header["mode"] != "lru":
+        raise ValueError("reuse-distance diagnostics require an LRU trace")
     phases = {}
     if coordinator_csv:
         with coordinator_csv.open(newline="", encoding="utf-8") as file:

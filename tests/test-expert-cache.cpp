@@ -322,12 +322,94 @@ void test_read_failure(file_source & files, file_source::outcome outcome) {
     GGML_ASSERT(stats.disk_reads == 3 && stats.bytes_read == 2 * expert_bytes && stats.cache_evictions == 1);
 }
 
+void test_tinylfu_reference(file_source & files) {
+    const auto budget = cache::required_bytes(expert_bytes, 4, true);
+    cache c(budget, expert_bytes, file_source::read, &files, true);
+    GGML_ASSERT(c.capacity() == 4 && c.stats().peak_allocated_bytes == budget);
+    GGML_ASSERT(cache::capacity_for_budget(budget - 1, expert_bytes, true) == 3);
+    try {
+        cache too_small(cache::required_bytes(expert_bytes, 2, true) - 1,
+                        expert_bytes, file_source::read, &files, true);
+        GGML_ASSERT(false);
+    } catch (const std::invalid_argument &) {}
+    struct trace_state {
+        cache::decision outcome;
+        uint64_t checksum = 14695981039346656037ULL;
+    } trace;
+    c.set_decision_trace([](void * context, const cache::decision & decision) noexcept {
+        static_cast<trace_state *>(context)->outcome = decision;
+    }, &trace);
+    c.set_trace([](void * context, uint64_t, int64_t, size_t, bool hit, size_t) noexcept {
+        auto & state = *static_cast<trace_state *>(context);
+        const auto & outcome = state.outcome;
+        for (auto value : {uint64_t(outcome.candidate_frequency), uint64_t(outcome.victim_frequency),
+                outcome.victim.tensor_source_id, uint64_t(outcome.victim.expert_id),
+                uint64_t(outcome.bypassed), uint64_t(outcome.aged), uint64_t(hit)}) {
+            state.checksum = (state.checksum ^ value) * 1099511628211ULL;
+        }
+    }, &trace);
+
+    for (int64_t index = 0; index < 256; ++index) {
+        const cache::key initial[] = {{0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 0}};
+        const cache::key key = index < 5 ? initial[index] : index % 5 == 0 ?
+            cache::key{uint64_t((index / 7) % 3), (index * 11 + index / 3) % 8} :
+            cache::key{0, index % 3};
+        verify(acquire(c, key), key);
+    }
+    // Generated with Policy("tinylfu", 3, 0, ()) from simulate-pager-policies.py.
+    GGML_ASSERT(trace.checksum == 7710516606872388577ULL);
+    const auto policy = c.policy_stats();
+    const auto stats = c.stats();
+    GGML_ASSERT(policy.updates == 256 && policy.aging_count == 8 && policy.sketch_bytes == 64);
+    GGML_ASSERT(policy.bypassed_misses && policy.admitted_misses > policy.resident_slots);
+    GGML_ASSERT(policy.admitted_misses + policy.bypassed_misses == stats.disk_reads);
+    GGML_ASSERT(stats.disk_reads + stats.cache_hits == policy.updates);
+    GGML_ASSERT(stats.bytes_read == stats.disk_reads * expert_bytes && !policy.transient_in_use);
+}
+
+void test_tinylfu_transient(file_source & files) {
+    const auto budget = cache::required_bytes(expert_bytes, 2, true);
+    cache c(budget, expert_bytes, file_source::read, &files, true);
+    const cache::key resident{0, 0}, rejected{1, 0}, other{2, 0};
+    verify(acquire(c, resident), resident);
+    auto resident_pin = acquire(c, resident);
+    auto pending = std::async(std::launch::async, [&] { return acquire(c, rejected); });
+    wait_for_waiters(c, 1);
+    GGML_ASSERT(!c.policy_stats().transient_in_use && c.stats().disk_reads == 1);
+    resident_pin.reset();
+    auto transient = get(pending);
+    verify(transient, rejected);
+    verify(acquire(c, resident), resident);
+    auto competing = std::async(std::launch::async, [&] { return acquire(c, other); });
+    wait_for_waiters(c, 1);
+    verify(transient, rejected);
+    GGML_ASSERT(c.policy_stats().transient_in_use && c.stats().disk_reads == 2);
+    transient.reset();
+    verify(get(competing), other);
+    GGML_ASSERT(c.policy_stats().transient_waits && !c.policy_stats().transient_in_use);
+    GGML_ASSERT(c.stats().cache_evictions == 0);
+
+    const cache::key failing{1, 2};
+    files.pause(0, failing, file_source::outcome::short_read);
+    auto failure = std::async(std::launch::async, [&] { return acquire(c, failing); });
+    files.wait_for_read(0);
+    auto follower = std::async(std::launch::async, [&] { return acquire(c, {2, 2}); });
+    wait_for_waiters(c, 1);
+    files.resume(0);
+    GGML_ASSERT(!get(failure));
+    verify(get(follower), {2, 2});
+    verify(acquire(c, resident), resident);
+    GGML_ASSERT(!c.policy_stats().transient_in_use && c.stats().pinned_slots == 0);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     GGML_ASSERT(argc == 2);
     file_source files(argv[1]);
     test_budget_and_lru(files);
+    test_tinylfu_reference(files);
+    test_tinylfu_transient(files);
     test_same_key_and_pins(files);
     test_distinct_keys(files);
     test_read_failure(files, file_source::outcome::short_read);

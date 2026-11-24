@@ -323,7 +323,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params,
-        int32_t stage_begin, int32_t stage_end) {
+        int32_t stage_begin, int32_t stage_end, bool pager_tinylfu) {
     try {
         if (params.external_expert_cache_size && !params.external_experts) {
             throw std::runtime_error("external Expert cache requires external_experts");
@@ -369,6 +369,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     stage_begin >= stage_end || uint32_t(stage_end) > model->hparams.n_layer()) {
                 throw std::runtime_error("invalid Qwen3MoE stage range");
             }
+            model->pager_tinylfu = pager_tinylfu;
             model->stage_begin = stage_begin;
             model->stage_end = stage_end;
         }
@@ -410,7 +411,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         std::vector<std::string> & splits,
         FILE * file,
         struct llama_model_params params,
-        int32_t stage_begin = 0, int32_t stage_end = -1) {
+        int32_t stage_begin = 0, int32_t stage_end = -1, bool pager_tinylfu = false) {
     {
         int n_sources_defined = 0;
         if (metadata != nullptr) {
@@ -453,7 +454,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
-        path_model, splits, file, params, stage_begin, stage_end);
+        path_model, splits, file, params, stage_begin, stage_end, pager_tinylfu);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -473,7 +474,13 @@ static struct llama_model * llama_model_load_from_file_impl(
 
 llama_model * llama_model_load_stage(const char * path, llama_model_params params,
                                     int32_t layer_begin, int32_t layer_end) {
+    return llama_model_load_stage(path, params, layer_begin, layer_end, false);
+}
+
+llama_model * llama_model_load_stage(const char * path, llama_model_params params,
+                                    int32_t layer_begin, int32_t layer_end, bool pager_tinylfu) {
     if (!path || layer_end <= 0 || params.vocab_only || params.load_mtp ||
+            (pager_tinylfu && (!params.external_experts || !params.external_expert_cache_size)) ||
             params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ||
             params.tensor_buft_overrides || params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         LLAMA_LOG_ERROR("%s: invalid CPU stage options\n", __func__);
@@ -484,7 +491,7 @@ llama_model * llama_model_load_stage(const char * path, llama_model_params param
     params.n_gpu_layers = 0;
     std::vector<std::string> splits;
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path, splits, nullptr,
-        params, layer_begin, layer_end);
+        params, layer_begin, layer_end, pager_tinylfu);
 }
 
 struct llama_model * llama_model_init_from_user(

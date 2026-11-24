@@ -184,6 +184,7 @@ struct options {
     bool chat = false;
     bool perf_details = false;
     uint32_t expert_trace_limit = 0;
+    std::string pager_policy = "lru";
     std::string perf_cache_state = "uncontrolled";
     std::vector<llama_token> prompt_tokens{};
 };
@@ -284,6 +285,11 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         if (key == "--system-file" || key == "--rendered-prompt-file") {
             require(!value.empty(), "chat file path cannot be empty");
             (key == "--system-file" ? cfg.system_file : cfg.rendered_prompt_file) = value;
+            continue;
+        }
+        if (key == "--pager-policy") {
+            require(value == "lru" || value == "tinylfu", "invalid Pager policy");
+            cfg.pager_policy = value;
             continue;
         }
         if (key == "--perf-cache-state") {
@@ -403,7 +409,7 @@ struct stage {
         mp.external_expert_cache_size = size_t(cfg.pager_mib) * 1048576;
         mp.use_extra_bufts = false;
         const auto load_start = perf ? steady_clock::now() : steady_clock::time_point{};
-        model.reset(llama_model_load_stage(cfg.model.c_str(), mp, begin, end));
+        model.reset(llama_model_load_stage(cfg.model.c_str(), mp, begin, end, cfg.pager_policy == "tinylfu"));
         require(bool(model) && uint32_t(llama_model_n_layer(model.get())) == cfg.layers, "stage model or layer count mismatch");
         if (perf) {
             perf->summary["model_load_wall_ms"] = stage_performance::elapsed(load_start);
@@ -433,6 +439,10 @@ struct stage {
             trace = std::make_unique<stage_expert_trace>();
             trace->events.resize(cfg.expert_trace_limit);
             llama_set_pager_trace(model.get(), stage_expert_trace::capture, trace.get());
+            if (cfg.pager_policy == "tinylfu") {
+                trace->decisions.resize(cfg.expert_trace_limit);
+                llama_set_pager_decision_trace(model.get(), stage_expert_trace::capture_decision, trace.get());
+            }
         }
         if (perf) {
             perf->summary["context_init_ms"] = stage_performance::elapsed(context_start);
@@ -440,8 +450,8 @@ struct stage {
             perf->summary["vocab"] = vocab;
             perf->summary["hidden"] = hidden;
         }
-        std::fprintf(stderr, "execution layers=[%u,%u) requested_ctx=%u effective_ctx=%u batch=%u threads=%u pager_budget_mib=%u\n",
-                begin, end, cfg.ctx, llama_n_ctx(context.get()), cfg.batch, cfg.threads, cfg.pager_mib);
+        std::fprintf(stderr, "execution layers=[%u,%u) requested_ctx=%u effective_ctx=%u batch=%u threads=%u pager_budget_mib=%u pager_policy=%s\n",
+                begin, end, cfg.ctx, llama_n_ctx(context.get()), cfg.batch, cfg.threads, cfg.pager_mib, cfg.pager_policy.c_str());
     }
 
     bytes metadata(const options & cfg) const {
@@ -517,6 +527,21 @@ struct stage {
             perf->summary["model_memory"] = {{"ordinary_tensor_bytes", normal_bytes}, {"expert_logical_bytes", expert_bytes},
                     {"kv_bytes", kv}, {"workspace_bytes", workspace}, {"expert_provider_count", experts}};
             perf->summary["pager"] = stage_performance::pager_json(stats, perf->stage_stats("")["input_tokens"].get<uint64_t>());
+            const auto & policy = stats.policy;
+            perf->summary["pager"].update(stage_performance::json{
+                {"resident_slots", policy.resident_slots}, {"transient_slots", policy.transient_slots},
+                {"transient_in_use", policy.transient_in_use},
+                {"peak_resident_in_use", policy.peak_resident_in_use},
+                {"peak_transient_in_use", policy.peak_transient_in_use},
+                {"transient_acquires", policy.bypassed_misses},
+                {"transient_waits", policy.transient_waits}, {"transient_wait_ns", policy.transient_wait_ns},
+                {"admitted_misses", policy.admitted_misses}, {"bypassed_misses", policy.bypassed_misses},
+                {"admission_comparisons", policy.comparisons}, {"admission_rejections", policy.rejections},
+                {"frequency_updates", policy.updates}, {"frequency_aging_count", policy.aging_count},
+                {"resident_payload_bytes", policy.resident_slots * policy.slot_stride},
+                {"transient_payload_bytes", policy.transient_slots * policy.slot_stride},
+                {"sketch_bytes", policy.sketch_bytes}, {"policy_management_bytes", policy.management_bytes},
+            });
         }
 #ifdef _WIN32
         PROCESS_MEMORY_COUNTERS memory{};
@@ -976,7 +1001,7 @@ int main(int argc, char ** argv) {
                 {"model_path", cfg.model}, {"identity_source", cfg.auto_identity ? "local-sha256" :
                         cfg.identity.empty() ? "metadata" : "label"},
                 {"split", cfg.split}, {"layers", cfg.layers}, {"context", cfg.ctx}, {"batch", cfg.batch},
-                {"threads", cfg.threads}, {"pager_budget_mib", cfg.pager_mib}, {"io", cfg.io},
+                {"threads", cfg.threads}, {"pager_budget_mib", cfg.pager_mib}, {"pager_policy", cfg.pager_policy}, {"io", cfg.io},
                 {"cache_state_label", cfg.perf_cache_state}, {"chat", cfg.role == "worker" ?
                         stage_performance::json(nullptr) : stage_performance::json(cfg.chat)},
                 {"max_new_tokens", cfg.role == "worker" ? stage_performance::json(nullptr) :

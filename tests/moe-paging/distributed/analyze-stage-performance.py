@@ -11,6 +11,7 @@ def load(path, role):
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema_version") != 1 or data.get("status") != "ok" or data.get("role") != role:
         raise ValueError(f"{path}: expected successful schema-v1 {role} metrics")
+    data.setdefault("pager_policy", "lru")  # Older Stage binaries use Global LRU.
     suffix = ".metrics.json"
     if not path.name.endswith(suffix):
         raise ValueError(f"{path}: expected a .metrics.json filename")
@@ -40,7 +41,7 @@ def compare(paths):
     values = [item[0] for item in (baseline, coordinator, worker)]
     base, front, back = values
     shared = ("revision", "version", "model_identity", "identity_source", "context",
-              "effective_context", "batch", "threads", "pager_budget_mib", "io",
+              "effective_context", "batch", "threads", "pager_budget_mib", "pager_policy", "io",
               "hidden", "vocab", "split", "layers", "cache_state_label")
     for key in shared:
         if any(item[key] != base[key] for item in values):
@@ -147,7 +148,7 @@ def main():
         reference = results[0][0][0]
         for values, _ in results[1:]:
             for key in ("prompt_token_sha256", "model_identity", "revision", "context", "batch", "threads",
-                        "pager_budget_mib", "io", "max_new_tokens", "cache_state_label"):
+                        "pager_budget_mib", "pager_policy", "io", "max_new_tokens", "cache_state_label"):
                 if values[0][key] != reference[key]:
                     raise ValueError(f"repetition differs: {key}")
         if len(results) > 1:

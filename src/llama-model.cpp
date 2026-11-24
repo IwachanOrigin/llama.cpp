@@ -1533,7 +1533,7 @@ struct llama_external_experts {
         total += count * size;
     }
 
-    void prepare(size_t budget, size_t max_slice, size_t count, const llama_files & shards, bool no_alloc) {
+    void prepare(size_t budget, size_t max_slice, size_t count, const llama_files & shards, bool no_alloc, bool tinylfu) {
         size_t overhead = sizeof(*this);
         account(overhead, 1, sizeof(ggml_backend_buffer));
         account(overhead, count, sizeof(tensor_source));
@@ -1554,8 +1554,8 @@ struct llama_external_experts {
                 throw std::runtime_error("external Expert cache budget does not fit one slot and provider metadata");
             }
             cache_budget = budget - overhead;
-            slots = llama_expert_cache::capacity_for_budget(cache_budget, max_slice);
-            planned_bytes = overhead + llama_expert_cache::required_bytes(max_slice, slots);
+            slots = llama_expert_cache::capacity_for_budget(cache_budget, max_slice, tinylfu);
+            planned_bytes = overhead + llama_expert_cache::required_bytes(max_slice, slots, tinylfu);
         } else {
             account(planned_bytes, 1, max_slice);
         }
@@ -1566,7 +1566,7 @@ struct llama_external_experts {
             if (budget) {
                 lru = std::make_unique<lru_state>();
                 lru->shard_mutexes = std::make_unique<std::mutex[]>(shards.size());
-                lru->cache = std::make_unique<llama_expert_cache>(cache_budget, max_slice, read_expert, this);
+                lru->cache = std::make_unique<llama_expert_cache>(cache_budget, max_slice, read_expert, this, tinylfu);
                 allocated_bytes = overhead + lru->cache->stats().peak_allocated_bytes;
             } else {
                 slot.resize(max_slice);
@@ -1574,7 +1574,7 @@ struct llama_external_experts {
             }
         }
         LLAMA_LOG_INFO("external Expert pager: mode=%s slots=%zu budget_bytes=%zu peak_allocated_bytes=%zu\n",
-            budget ? "lru" : "single", slots, budget, allocated_bytes);
+            budget ? (tinylfu ? "tinylfu" : "lru") : "single", slots, budget, allocated_bytes);
     }
 
     ~llama_external_experts() {
@@ -2337,7 +2337,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 logical_bytes += bytes;
                 ++source_count;
             }
-            external.prepare(params.external_expert_cache_size, slot_bytes, source_count, ml.files, ml.no_alloc);
+            external.prepare(params.external_expert_cache_size, slot_bytes, source_count, ml.files, ml.no_alloc, pager_tinylfu);
             size_t source_id = 0;
             for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
                 const auto & weight = ml.require_weight(t->name);
@@ -2914,7 +2914,8 @@ llama_pager_metrics llama_model::pager_metrics() const {
     }
     return {stats.cache_hits, stats.cache_misses, stats.cache_evictions, stats.disk_reads, stats.bytes_read,
         stats.io_wait_ns, stats.cache_wait_ns + lease_wait, stats.capacity_wait_ns, lease_wait,
-        stats.pinned_slots, no_alloc() ? pager.planned_bytes : pager.allocated_bytes, pager.slots, pager.max_expert_bytes};
+        stats.pinned_slots, no_alloc() ? pager.planned_bytes : pager.allocated_bytes, pager.slots, pager.max_expert_bytes,
+        pager.lru ? pager.lru->cache->policy_stats() : llama_expert_cache::policy_statistics{}};
 }
 
 size_t llama_model::pager_budget_for_slots(size_t slots) const {
@@ -2923,11 +2924,21 @@ size_t llama_model::pager_budget_for_slots(size_t slots) const {
     }
     auto & pager = *pimpl->external_experts;
     size_t total = pager.lru_overhead;
-    llama_external_experts::account(total, 1, llama_expert_cache::required_bytes(pager.max_expert_bytes, slots));
+    llama_external_experts::account(total, 1, llama_expert_cache::required_bytes(pager.max_expert_bytes, slots, pager_tinylfu));
     return total;
 }
 
 llama_pager_metrics llama_get_pager_metrics(const llama_model * model) { return model->pager_metrics(); }
+void llama_set_pager_decision_trace(llama_model * model, llama_expert_cache::decision_fn callback, void * context) {
+    model->set_pager_decision_trace(callback, context);
+}
+
+void llama_model::set_pager_decision_trace(llama_expert_cache::decision_fn callback, void * context) {
+    if (pimpl->external_experts && pimpl->external_experts->lru) {
+        pimpl->external_experts->lru->cache->set_decision_trace(callback, context);
+    }
+}
+
 void llama_model::set_pager_trace(llama_pager_trace_fn callback, void * context) {
     if (!pimpl->external_experts) {
         return;

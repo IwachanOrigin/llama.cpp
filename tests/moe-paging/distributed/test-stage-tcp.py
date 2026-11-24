@@ -82,12 +82,12 @@ def start_worker(exe, model, io, prefix, label, fault=None, extra=()):
             child.stdout.close()
 
 
-def distributed(exe, model, io, root, label):
+def distributed(exe, model, io, root, label, extra=()):
     baseline, front, back = [root / role for role in ("baseline", "front", "back")]
-    run(command(exe, "baseline", model, 0, io, baseline, label), root / "baseline.log")
-    with start_worker(exe, model, io, back, label) as (child, port, log):
+    run(command(exe, "baseline", model, 0, io, baseline, label) + list(extra), root / "baseline.log")
+    with start_worker(exe, model, io, back, label, extra=extra) as (child, port, log):
         with (root / "front.log").open("wb") as out:
-            coordinator = subprocess.Popen(command(exe, "coordinator", model, port, io, front, label),
+            coordinator = subprocess.Popen(command(exe, "coordinator", model, port, io, front, label) + list(extra),
                                            stdout=out, stderr=subprocess.STDOUT)
             verify(coordinator.pid != child.pid, "worker and coordinator must be distinct processes")
             try:
@@ -282,6 +282,18 @@ def generation(exe, model, root, label):
     verify(len(trace["requests"]) == 5 and trace["trace_metadata"]["dropped"] == 0 and
            sum(row["hits"] + row["misses"] for row in trace["requests"]) == trace["trace_metadata"]["events"],
            "Expert trace requests do not reconcile")
+    tinylfu = root / "trace-tinylfu"
+    run(command(exe, "baseline", model, 0, "mmap", tinylfu, label) + options +
+        ["--pager-policy", "tinylfu", "--pager-budget-mib", "2", "--expert-trace-limit", "10000", "--perf-details"],
+        root / "trace-tinylfu.log")
+    for suffix in (".generated_tokens", ".generated.txt"):
+        verify(tinylfu.with_suffix(suffix).read_bytes() == baseline.with_suffix(suffix).read_bytes(),
+               "TinyLFU changed generation")
+    simulation = runpy.run_path(str(Path(__file__).with_name("simulate-pager-policies.py")))
+    replay = simulation["verify_tinylfu"](tinylfu.with_suffix(".experts.jsonl"))
+    pager = json.loads(tinylfu.with_suffix(".metrics.json").read_text())["pager"]
+    verify(replay["misses"] == pager["disk_reads"] and replay["events"] == pager["frequency_updates"] and
+           replay["bypassed"] > 0 and not pager["transient_in_use"], "TinyLFU metrics differ from replay")
     with profiled.with_suffix(".perf.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     verify(len(rows) == 5 and all(row["receive_bytes"] == "" for row in rows) and
@@ -377,6 +389,14 @@ def main(exe, single, split, logs=None):
                 path = root / f"layout-{index}-{io}"
                 path.mkdir()
                 distributed(exe, model, io, path, label)
+                if io == "mmap":
+                    tiny = path / "tinylfu"
+                    tiny.mkdir()
+                    distributed(exe, model, io, tiny, label, ["--pager-policy", "tinylfu", "--pager-budget-mib", "2"])
+                    names = (".boundary", ".logits", ".ffn_moe_topk-0", ".ffn_moe_topk-1")
+                    for suffix in names:
+                        verify((tiny / ("baseline" + suffix)).read_bytes() == (path / ("baseline" + suffix)).read_bytes(),
+                               f"TinyLFU changed fixed-token {suffix}")
             if index == 0:
                 path = root / "faults"
                 path.mkdir()

@@ -108,8 +108,11 @@ class Policy:
         """Return outcome and number of resident victims; a bypass still reads."""
         if not self.slots:
             return "bypassed", 0
+        self.last_admission = (-1, 0, 0, 0, False, False)
         if self.sketch:
+            aged = self.sketch.count == self.sketch.period
             self.sketch.observe(key)
+            self.last_admission = (-1, 0, 0, 0, False, aged)
         if self.name == "layer-lru":
             limit, entries = self.partition[layer]
         else:
@@ -142,8 +145,14 @@ class Policy:
         evictions = 0
         if len(entries) + len(self.protected) == limit:
             victim = min(entries, key=entries.get) if self.name == "lfu" else next(iter(entries))
-            if self.sketch and self.sketch.frequency(key) <= self.sketch.frequency(victim):
-                return "bypassed", 0
+            if self.sketch:
+                candidate_frequency = self.sketch.frequency(key)
+                victim_frequency = self.sketch.frequency(victim)
+                bypassed = candidate_frequency <= victim_frequency
+                self.last_admission = (candidate_frequency, victim_frequency, *victim, bypassed,
+                                       self.last_admission[-1])
+                if bypassed:
+                    return "bypassed", 0
             del entries[victim]
             evictions = 1
         entries[key] = 1
@@ -331,9 +340,44 @@ def compare(folder, role, budgets, variants):
     return {**provenance, "results": results}
 
 
+def verify_tinylfu(path):
+    header, rows = TRACE["read_trace"](path)
+    if (header["mode"] != "tinylfu" or header["contexts"] != 1 or header["transient_slots"] != 1
+            or header["resident_slots"] != header["slots"] - 1 or header["resident_slots"] < 1):
+        raise ValueError("expected a serial TinyLFU trace with one transient slot")
+    suffix = ".experts.jsonl"
+    if not path.name.endswith(suffix):
+        raise ValueError("expected .experts.jsonl input")
+    detail = path.with_name(path.name[:-len(suffix)] + ".admission.jsonl")
+    policy = Policy("tinylfu", header["resident_slots"], 0, ())
+    totals = Counter()
+    with detail.open(encoding="utf-8") as decisions, path.open(encoding="utf-8") as events:
+        next(events)
+        for index, (key, size, _, observed_hit) in enumerate(rows):
+            outcome, evicted = policy.access(key, 0)
+            expected = [index, *policy.last_admission]
+            if json.loads(next(decisions)) != expected or observed_hit != (outcome == "hits"):
+                raise ValueError(f"admission differs at event {index}, expected {expected}, {outcome}")
+            slot = json.loads(next(events))[4]
+            if (slot == header["resident_slots"]) != (outcome == "bypassed"):
+                raise ValueError(f"wrong slot kind at event {index}")
+            totals[outcome] += 1
+            totals["evictions"] += evicted
+            totals["bytes_read"] += size if not observed_hit else 0
+        if next(decisions, None) is not None:
+            raise ValueError("extra admission records")
+    misses = totals["admitted"] + totals["bypassed"]
+    if (totals["hits"], misses, misses, totals["evictions"], totals["bytes_read"]) != tuple(
+            header[name] for name in ("hits", "misses", "reads", "evictions", "bytes_read")):
+        raise ValueError("TinyLFU replay totals differ from observed counters")
+    return {"events": len(rows), "hits": totals["hits"], "misses": misses, **totals}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--development", type=Path, required=True, help="Prompt A run directory")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--development", type=Path, help="Prompt A run directory")
+    mode.add_argument("--verify-tinylfu", type=Path, help="verify a C++ trace and its admission sidecar")
     parser.add_argument("--evaluation", action="append", nargs=2, default=[], metavar=("LABEL", "RUN_DIRECTORY"))
     parser.add_argument("--roles", nargs="+", choices=("baseline", "coordinator", "worker"),
                         default=("baseline", "coordinator", "worker"))
@@ -341,6 +385,13 @@ def main():
     parser.add_argument("--policies", nargs="+", choices=VARIANTS, default=tuple(VARIANTS))
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    if args.verify_tinylfu:
+        try:
+            report = verify_tinylfu(args.verify_tinylfu)
+            args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        except (OSError, ValueError, KeyError, TypeError, StopIteration) as error:
+            parser.exit(1, f"TinyLFU verification failed: {error}\n")
+        return
     labels = [label for label, _ in args.evaluation]
     if any(budget <= 0 for budget in args.budgets) or "A" in labels or len(labels) != len(set(labels)):
         parser.error("use positive budgets and unique evaluation labels other than A")

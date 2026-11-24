@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-expert-cache.h"
+
 // this is a staging header for new llama.cpp API
 // breaking changes and C++ are allowed. everything here should be considered WIP
 // try as much as possible to not include this header in the rest of the codebase
@@ -120,12 +122,16 @@ struct llama_pager_metrics {
     uint64_t cache_hits, cache_misses, cache_evictions, disk_reads, bytes_read;
     uint64_t io_wait_ns, cache_wait_ns, capacity_wait_ns, lease_wait_ns;
     size_t pinned_slots, peak_allocated_bytes, slots, max_expert_bytes;
+    llama_expert_cache::policy_statistics policy{};
 };
 // Qwen3MoE CPU stage with an exclusive upper layer bound.
 LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_params params,
                                               int32_t layer_begin, int32_t layer_end);
+LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_params params,
+                                              int32_t layer_begin, int32_t layer_end, bool pager_tinylfu);
 using llama_pager_trace_fn = void (*)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept;
 // Call only while no contexts using this model are computing.
+LLAMA_API void llama_set_pager_decision_trace(llama_model * model, llama_expert_cache::decision_fn callback, void * context);
 LLAMA_API void llama_set_pager_trace(llama_model * model, llama_pager_trace_fn callback, void * context);
 LLAMA_API std::map<uint64_t, std::string> llama_pager_source_names(const llama_model * model);
 
