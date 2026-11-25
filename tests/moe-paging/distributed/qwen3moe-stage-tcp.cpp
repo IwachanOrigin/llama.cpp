@@ -184,6 +184,8 @@ struct options {
     bool chat = false;
     bool perf_details = false;
     uint32_t expert_trace_limit = 0;
+    uint32_t expert_io_trace_limit = 0;
+    uint32_t expert_prefetch_depth = 0;
     std::string pager_policy = "lru";
     std::string perf_cache_state = "uncontrolled";
     std::vector<llama_token> prompt_tokens{};
@@ -287,6 +289,11 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             (key == "--system-file" ? cfg.system_file : cfg.rendered_prompt_file) = value;
             continue;
         }
+        if (key == "--expert-prefetch-depth") {
+            require(value == "0" || value == "1", "Expert prefetch depth must be 0 or 1");
+            cfg.expert_prefetch_depth = value == "1";
+            continue;
+        }
         if (key == "--pager-policy") {
             require(value == "lru" || value == "tinylfu", "invalid Pager policy");
             cfg.pager_policy = value;
@@ -322,6 +329,10 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         else if (key == "--batch") cfg.batch = n;
         else if (key == "--threads") cfg.threads = n;
         else if (key == "--pager-budget-mib") cfg.pager_mib = n;
+        else if (key == "--expert-io-trace-limit") {
+            require(n <= 200000, "Expert I/O trace limit exceeds 200000");
+            cfg.expert_io_trace_limit = n;
+        }
         else if (key == "--expert-trace-limit") cfg.expert_trace_limit = n;
         else if (key == "--prefill") {
             cfg.prefill = n;
@@ -409,7 +420,7 @@ struct stage {
         mp.external_expert_cache_size = size_t(cfg.pager_mib) * 1048576;
         mp.use_extra_bufts = false;
         const auto load_start = perf ? steady_clock::now() : steady_clock::time_point{};
-        model.reset(llama_model_load_stage(cfg.model.c_str(), mp, begin, end, cfg.pager_policy == "tinylfu"));
+        model.reset(llama_model_load_stage(cfg.model.c_str(), mp, begin, end, cfg.pager_policy == "tinylfu", cfg.expert_prefetch_depth != 0));
         require(bool(model) && uint32_t(llama_model_n_layer(model.get())) == cfg.layers, "stage model or layer count mismatch");
         if (perf) {
             perf->summary["model_load_wall_ms"] = stage_performance::elapsed(load_start);
@@ -437,7 +448,16 @@ struct stage {
         require(bool(context), "cannot create stage context");
         if (cfg.expert_trace_limit) {
             trace = std::make_unique<stage_expert_trace>();
+            trace->prefetch_enabled = cfg.expert_prefetch_depth != 0;
             trace->events.resize(cfg.expert_trace_limit);
+            if (cfg.expert_io_trace_limit) {
+                trace->io_prefix = cfg.output;
+                trace->reads.resize(cfg.expert_io_trace_limit);
+                llama_set_expert_io_trace(model.get(), stage_expert_trace::capture_io, trace.get());
+                if (cfg.expert_prefetch_depth) {
+                    llama_set_expert_prefetch_delivery_trace(model.get(), stage_expert_trace::capture_delivery, trace.get());
+                }
+            }
             llama_set_pager_trace(model.get(), stage_expert_trace::capture, trace.get());
             if (cfg.pager_policy == "tinylfu") {
                 trace->decisions.resize(cfg.expert_trace_limit);
@@ -450,8 +470,8 @@ struct stage {
             perf->summary["vocab"] = vocab;
             perf->summary["hidden"] = hidden;
         }
-        std::fprintf(stderr, "execution layers=[%u,%u) requested_ctx=%u effective_ctx=%u batch=%u threads=%u pager_budget_mib=%u pager_policy=%s\n",
-                begin, end, cfg.ctx, llama_n_ctx(context.get()), cfg.batch, cfg.threads, cfg.pager_mib, cfg.pager_policy.c_str());
+        std::fprintf(stderr, "execution layers=[%u,%u) requested_ctx=%u effective_ctx=%u batch=%u threads=%u pager_budget_mib=%u pager_policy=%s expert_prefetch_depth=%u\n",
+                begin, end, cfg.ctx, llama_n_ctx(context.get()), cfg.batch, cfg.threads, cfg.pager_mib, cfg.pager_policy.c_str(), cfg.expert_prefetch_depth);
     }
 
     bytes metadata(const options & cfg) const {
@@ -472,7 +492,11 @@ struct stage {
         if (trace) trace->decoding = std::strcmp(phase, "decode") == 0;
         const auto before = sample ? llama_get_pager_metrics(model.get()) : llama_pager_metrics{};
         const auto start = steady_clock::now();
-        require(llama_decode(context.get(), batch) == 0, "stage decode failed");
+        const auto status = llama_decode(context.get(), batch);
+        if (status && trace && !trace->reads.empty()) {
+            trace->save_io(trace->io_prefix, false);
+        }
+        require(status == 0, "stage decode failed");
         llama_synchronize(context.get());
         const auto ms = std::chrono::duration<double, std::milli>(steady_clock::now() - start).count();
         if (sample) {
@@ -528,6 +552,26 @@ struct stage {
                     {"kv_bytes", kv}, {"workspace_bytes", workspace}, {"expert_provider_count", experts}};
             perf->summary["pager"] = stage_performance::pager_json(stats, perf->stage_stats("")["input_tokens"].get<uint64_t>());
             const auto & policy = stats.policy;
+            const auto prefetch = llama_get_expert_prefetch_metrics(model.get());
+            perf->summary["prefetch"] = {
+                {"enabled", prefetch.payload_bytes != 0}, {"slots", prefetch.payload_bytes ? 1 : 0},
+                {"payload_bytes", prefetch.payload_bytes}, {"management_bytes", prefetch.management_bytes},
+                {"requests", prefetch.requests}, {"issued", prefetch.issued},
+                {"skipped_resident", prefetch.skipped_resident}, {"skipped_busy", prefetch.skipped_busy},
+                {"duplicate_requests", prefetch.duplicates}, {"reads_started", prefetch.reads_started},
+                {"reads_completed", prefetch.reads_completed}, {"reads_failed", prefetch.reads_failed},
+                {"bytes_requested", prefetch.requested_bytes}, {"bytes_read", prefetch.bytes_read},
+                {"reader_ns", prefetch.reader_ns}, {"overlap_ns", prefetch.overlap_ns},
+                {"consumed", prefetch.consumed_ready + prefetch.consumed_waited},
+                {"consumed_ready", prefetch.consumed_ready}, {"consumed_waited", prefetch.consumed_waited},
+                {"wait_count", prefetch.wait_count}, {"wait_ns", prefetch.wait_ns},
+                {"cancelled_before_read", prefetch.cancelled}, {"discarded", prefetch.discarded},
+                {"discarded_bytes", prefetch.discarded_bytes}, {"fallback_reads", prefetch.fallback_reads},
+                {"demand_reads", stats.disk_reads - prefetch.reads_started},
+                {"demand_bytes_read", stats.bytes_read - prefetch.bytes_read},
+                {"peak_in_use", prefetch.peak_in_use}, {"in_use", prefetch.in_use},
+                {"copy_bytes", 0}, {"copy_count", 0}, {"copy_ns", 0},
+            };
             perf->summary["pager"].update(stage_performance::json{
                 {"resident_slots", policy.resident_slots}, {"transient_slots", policy.transient_slots},
                 {"transient_in_use", policy.transient_in_use},
@@ -1001,11 +1045,22 @@ int main(int argc, char ** argv) {
                 {"model_path", cfg.model}, {"identity_source", cfg.auto_identity ? "local-sha256" :
                         cfg.identity.empty() ? "metadata" : "label"},
                 {"split", cfg.split}, {"layers", cfg.layers}, {"context", cfg.ctx}, {"batch", cfg.batch},
-                {"threads", cfg.threads}, {"pager_budget_mib", cfg.pager_mib}, {"pager_policy", cfg.pager_policy}, {"io", cfg.io},
+                {"threads", cfg.threads}, {"pager_budget_mib", cfg.pager_mib}, {"pager_policy", cfg.pager_policy},
+                {"expert_prefetch_depth", cfg.expert_prefetch_depth}, {"io", cfg.io},
                 {"cache_state_label", cfg.perf_cache_state}, {"chat", cfg.role == "worker" ?
                         stage_performance::json(nullptr) : stage_performance::json(cfg.chat)},
                 {"max_new_tokens", cfg.role == "worker" ? stage_performance::json(nullptr) :
                         stage_performance::json(cfg.max_new_tokens)}};
+        }
+        if (cfg.expert_io_trace_limit) {
+            cfg.expert_trace_limit = std::max(cfg.expert_trace_limit, cfg.expert_io_trace_limit);
+            require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + ".expert-io.jsonl")),
+                    "use a fresh Expert I/O trace output prefix");
+            if (cfg.expert_prefetch_depth) {
+                require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + ".prefetch-delivery.jsonl")),
+                        "use a fresh Expert prefetch delivery trace prefix");
+            }
+            if (perf) perf->summary["expert_io_trace_limit"] = cfg.expert_io_trace_limit;
         }
         if (cfg.expert_trace_limit) {
             require(!std::filesystem::exists(std::filesystem::u8path(cfg.output + ".experts.jsonl")),
@@ -1096,7 +1151,10 @@ int main(int argc, char ** argv) {
         require(status == state::closed, "session did not close");
         local.report();
         local.output.save();
-        if (local.trace) local.trace->save(cfg.output, cfg.role, local.model.get());
+        if (local.trace) {
+            local.trace->save(cfg.output, cfg.role, local.model.get());
+            local.trace->save_io(cfg.output, true);
+        }
         if (perf) perf->save(true);
         std::fprintf(stderr, "CLOSED\n");
         return 0;

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <chrono>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -211,7 +212,7 @@ struct llama_file::impl {
         }
     }
 
-    void read_raw_unsafe(void * ptr, size_t len) {
+    void read_raw_unsafe(void * ptr, size_t len, llama_file_read_sample * sample = nullptr) {
         if (len == 0) {
             return;
         }
@@ -227,10 +228,18 @@ struct llama_file::impl {
             while (bytes_read < read_size) {
                 const DWORD to_read = (DWORD) std::min<size_t>(read_size - bytes_read, MAXDWORD);
                 DWORD chunk_read = 0;
+                using clock = std::chrono::steady_clock;
+                const auto start = sample ? clock::now() : clock::time_point{};
                 BOOL result = ReadFile(fp_win32, reinterpret_cast<char *>(ptr) + bytes_read,
                                        to_read, &chunk_read, NULL);
+                const DWORD error = result ? ERROR_SUCCESS : GetLastError();
+                if (sample) {
+                    ++sample->read_api_calls;
+                    sample->read_api_bytes += chunk_read;
+                    sample->read_api_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
+                }
                 if (!result) {
-                    throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+                    throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(error).c_str()));
                 }
                 if (chunk_read < to_read) {
                     throw std::runtime_error("unexpectedly reached end of file");
@@ -346,7 +355,7 @@ struct llama_file::impl {
         seek(offset + len, SEEK_SET);
     }
 
-    void read_raw(void * ptr, size_t len) {
+    void read_raw(void * ptr, size_t len, llama_file_read_sample * sample = nullptr) {
         if (len == 0) {
             return;
         }
@@ -359,7 +368,10 @@ struct llama_file::impl {
         if (has_direct_io()) {
             read_aligned_chunk(ptr, len);
         } else {
-            read_raw_unsafe(ptr, len);
+            if (sample) {
+                sample->read_api_measured = true;
+            }
+            read_raw_unsafe(ptr, len, sample);
         }
     }
 
@@ -673,12 +685,17 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-void llama_file::read_exact_at(size_t offset, void * ptr, size_t len) {
+void llama_file::read_exact_at(size_t offset, void * ptr, size_t len, llama_file_read_sample * sample) {
     if (offset > size() || len > size() - offset) {
         throw std::runtime_error("read range is outside the file");
     }
     seek(offset, SEEK_SET);
+#ifdef _WIN32
+    pimpl->read_raw(ptr, len, sample);
+#else
+    (void) sample; // stdio calls cannot report underlying kernel syscalls.
     read_raw(ptr, len);
+#endif
     if (tell() != offset + len) {
         throw std::runtime_error("short read");
     }

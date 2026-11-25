@@ -1695,6 +1695,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    const struct ggml_cpu_external_expert_prefetch * prefetch = external ? external->prefetch : NULL;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1709,21 +1710,38 @@ static void ggml_compute_forward_mul_mat_id(
 
         const char * src0_cur;
         struct ggml_cpu_external_expert_lease lease = { 0 };
+        uint64_t expert_compute_begin = 0;
         if (external) {
             if (ith == 0) {
-                lease = external->acquire(external->context, cur_a, nb02);
+                lease = prefetch ? prefetch->acquire(external->context, cur_a, nb02, dst) :
+                    external->acquire(external->context, cur_a, nb02);
+                if (prefetch && lease.data) {
+                    int next = cur_a + 1;
+                    while (next < n_as && !matrix_row_counts[next]) {
+                        ++next;
+                    }
+                    if (next < n_as) {
+                        prefetch->issue(external->context, dst, next, nb02);
+                    }
+                }
                 params->threadpool->external_expert_data = lease.data;
             }
             ggml_barrier(params->threadpool);
             src0_cur = params->threadpool->external_expert_data;
             if (!src0_cur) {
                 if (ith == 0) {
+                    if (prefetch) {
+                        prefetch->finish(external->context, dst);
+                    }
                     params->threadpool->ec = GGML_STATUS_FAILED;
                 }
                 return;
             }
         } else {
             src0_cur = (const char *) src0->data + cur_a * nb02;
+        }
+        if (prefetch && ith == 0) {
+            expert_compute_begin = prefetch->compute_begin(external->context);
         }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -1779,10 +1797,16 @@ static void ggml_compute_forward_mul_mat_id(
         if (external) {
             ggml_barrier(params->threadpool);
             if (ith == 0) {
+                if (prefetch) {
+                    prefetch->compute_end(external->context, dst, expert_compute_begin);
+                }
                 external->release(external->context, lease);
                 params->threadpool->external_expert_data = NULL;
             }
         }
+    }
+    if (prefetch && ith == 0) {
+        prefetch->finish(external->context, dst);
     }
 }
 

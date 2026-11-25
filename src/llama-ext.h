@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-expert-cache.h"
+#include "llama-mmap.h"
 
 // this is a staging header for new llama.cpp API
 // breaking changes and C++ are allowed. everything here should be considered WIP
@@ -129,6 +130,20 @@ LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_pa
                                               int32_t layer_begin, int32_t layer_end);
 LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_params params,
                                               int32_t layer_begin, int32_t layer_end, bool pager_tinylfu);
+LLAMA_API llama_model * llama_model_load_stage(const char * path, llama_model_params params,
+                                              int32_t layer_begin, int32_t layer_end, bool pager_tinylfu, bool prefetch);
+LLAMA_API llama_expert_cache::prefetch_statistics llama_get_expert_prefetch_metrics(const llama_model * model);
+LLAMA_API void llama_set_expert_prefetch_delivery_trace(llama_model * model, llama_expert_cache::delivery_fn callback, void * context);
+struct llama_expert_io_sample {
+    uint64_t source, expert, shard, offset, bytes;
+    uint64_t begin_ns, wait_ns, end_ns;
+    llama_file_read_sample file{};
+    bool success = false;
+    uint64_t prefetch_id = 0;
+};
+// Install only on a quiescent model. Callback may be concurrent across contexts.
+using llama_expert_io_trace_fn = void (*)(void *, const llama_expert_io_sample &) noexcept;
+LLAMA_API void llama_set_expert_io_trace(llama_model * model, llama_expert_io_trace_fn callback, void * context);
 using llama_pager_trace_fn = void (*)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept;
 // Call only while no contexts using this model are computing.
 LLAMA_API void llama_set_pager_decision_trace(llama_model * model, llama_expert_cache::decision_fn callback, void * context);

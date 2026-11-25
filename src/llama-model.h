@@ -788,6 +788,7 @@ struct llama_rope_params {
 
 struct llama_model {
     bool pager_tinylfu = false;
+    bool pager_prefetch = false;
     int32_t stage_begin = 0;
     int32_t stage_end = -1;
     int32_t stage_layer_end() const { return stage_end < 0 ? hparams.n_layer() : stage_end; }
@@ -1007,6 +1008,9 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
     llama_pager_metrics pager_metrics() const;
+    llama_expert_cache::prefetch_statistics expert_prefetch_metrics() const;
+    void set_expert_prefetch_delivery_trace(llama_expert_cache::delivery_fn callback, void * context);
+    void set_expert_io_trace(void (*callback)(void *, const struct llama_expert_io_sample &) noexcept, void * context);
     void set_pager_decision_trace(llama_expert_cache::decision_fn callback, void * context);
     void set_pager_trace(void (*callback)(void *, uint64_t, int64_t, size_t, bool, size_t) noexcept, void * context);
     std::map<uint64_t, std::string> pager_source_names() const;

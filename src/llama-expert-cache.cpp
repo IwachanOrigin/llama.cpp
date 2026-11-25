@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <thread>
 
 namespace {
 
@@ -92,6 +93,16 @@ std::array<uint64_t, 2> expert_hash(llama_expert_cache::key key) {
     return {initial ^ state[0] ^ state[8], iv[1] ^ state[1] ^ state[9]};
 }
 
+thread_local uint64_t current_prefetch_id = 0;
+
+uint64_t timestamp_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(cache_clock::now().time_since_epoch()).count();
+}
+
+bool same_key(llama_expert_cache::key left, llama_expert_cache::key right) {
+    return left.tensor_source_id == right.tensor_source_id && left.expert_id == right.expert_id;
+}
+
 } // namespace
 
 struct llama_expert_cache::slot {
@@ -143,6 +154,184 @@ struct llama_expert_cache::admission {
         return frequency(expert, true);
     }
 };
+
+struct llama_expert_cache::prefetch_state {
+    enum class state { empty, queued, reading, ready, failed };
+    state status = state::empty;
+    bool stopping = false, discard = false;
+    const void * scope = nullptr;
+    key expert{};
+    size_t bytes = 0;
+    unsigned char * data = nullptr;
+    uint64_t start_ns = 0, end_ns = 0;
+    uint64_t compute_from_ns = 0, compute_to_ns = 0;
+
+    void account_overlap() {
+        if (!end_ns || !compute_to_ns) {
+            return;
+        }
+        const auto from = std::max(compute_from_ns, start_ns);
+        const auto to = std::min(compute_to_ns, end_ns);
+        if (to > from) {
+            stats.overlap_ns += to - from;
+        }
+        compute_to_ns = 0;
+    }
+    prefetch_statistics stats;
+    delivery_fn delivery = nullptr;
+    void * delivery_context = nullptr;
+    std::thread thread;
+};
+
+size_t llama_expert_cache::prefetch_bytes(size_t max_expert_bytes) {
+    const size_t stride = aligned_size(max_expert_bytes);
+    if (stride > SIZE_MAX - aligned_size(sizeof(prefetch_state))) {
+        throw std::overflow_error("expert prefetch size overflow");
+    }
+    return stride + aligned_size(sizeof(prefetch_state));
+}
+
+uint64_t llama_expert_cache::prefetch_reader_id() noexcept {
+    return current_prefetch_id;
+}
+
+void llama_expert_cache::set_prefetch_delivery_trace(delivery_fn callback, void * context) noexcept {
+    if (pending) {
+        pending->delivery = callback;
+        pending->delivery_context = context;
+    }
+}
+
+void llama_expert_cache::prefetch_loop() {
+    std::unique_lock<std::mutex> lock(mutex);
+    auto & job = *pending;
+    for (;;) {
+        changed.wait(lock, [&] { return job.stopping || job.status == prefetch_state::state::queued; });
+        if (job.stopping) {
+            return;
+        }
+        job.status = prefetch_state::state::reading;
+        ++job.stats.reads_started;
+        job.stats.requested_bytes += job.bytes;
+        ++counters.disk_reads;
+        job.start_ns = timestamp_ns();
+        current_prefetch_id = job.stats.issued;
+        lock.unlock();
+        bool success = false;
+        try {
+            success = reader(reader_context, job.expert, job.data, job.bytes);
+        } catch (...) {
+            // Demand uses the existing synchronous recovery path.
+        }
+        current_prefetch_id = 0;
+        const auto finish = timestamp_ns();
+        lock.lock();
+        job.end_ns = finish;
+        job.account_overlap();
+        job.stats.reader_ns += finish - job.start_ns;
+        counters.io_wait_ns += finish - job.start_ns;
+        if (success) {
+            ++job.stats.reads_completed;
+            job.stats.bytes_read += job.bytes;
+            counters.bytes_read += job.bytes;
+        } else {
+            ++job.stats.reads_failed;
+        }
+        job.status = success ? prefetch_state::state::ready : prefetch_state::state::failed;
+        if (job.discard) {
+            discard_prefetch();
+        }
+        changed.notify_all();
+    }
+}
+
+void llama_expert_cache::discard_prefetch() {
+    auto & job = *pending;
+    switch (job.status) {
+        case prefetch_state::state::reading:
+            job.discard = true;
+            return;
+        case prefetch_state::state::queued:
+            ++job.stats.cancelled;
+            break;
+        case prefetch_state::state::ready:
+            ++job.stats.discarded;
+            job.stats.discarded_bytes += job.bytes;
+            break;
+        default:
+            break;
+    }
+    job.status = prefetch_state::state::empty;
+    job.scope = nullptr;
+}
+
+void llama_expert_cache::try_prefetch(const void * scope, key expert, size_t bytes) {
+    if (!pending || !scope || expert.expert_id < 0 || !bytes || bytes > max_expert_bytes) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    auto & job = *pending;
+    ++job.stats.requests;
+    if (job.status != prefetch_state::state::empty) {
+        if (job.scope == scope && same_key(job.expert, expert)) {
+            ++job.stats.duplicates;
+        } else {
+            ++job.stats.skipped_busy;
+        }
+        return;
+    }
+    const size_t residents = slot_count - (frequency != nullptr);
+    for (size_t index = 0; index < residents; ++index) {
+        if ((slots[index].status == slot::state::ready || slots[index].status == slot::state::loading) &&
+                same_key(slots[index].expert, expert)) {
+            ++job.stats.skipped_resident;
+            return;
+        }
+    }
+    job.scope = scope;
+    job.expert = expert;
+    job.bytes = bytes;
+    job.discard = false;
+    job.start_ns = job.end_ns = 0;
+    job.compute_from_ns = job.compute_to_ns = 0;
+    job.status = prefetch_state::state::queued;
+    ++job.stats.issued;
+    job.stats.peak_in_use = 1;
+    changed.notify_all();
+}
+
+uint64_t llama_expert_cache::compute_begin() const noexcept {
+    return pending ? timestamp_ns() : 0;
+}
+
+void llama_expert_cache::compute_end(const void * scope, uint64_t begin) {
+    const auto end = timestamp_ns();
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pending && pending->scope == scope && !pending->discard) {
+        pending->compute_from_ns = begin;
+        pending->compute_to_ns = end;
+        pending->account_overlap();
+    }
+}
+
+void llama_expert_cache::finish_prefetch(const void * scope) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (pending && pending->scope == scope) {
+        discard_prefetch();
+        changed.notify_all();
+        changed.wait(lock, [&] { return pending->scope != scope; });
+    }
+}
+
+llama_expert_cache::prefetch_statistics llama_expert_cache::prefetch_stats() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pending) {
+        return {};
+    }
+    auto result = pending->stats;
+    result.in_use = pending->status != prefetch_state::state::empty;
+    return result;
+}
 
 size_t llama_expert_cache::required_bytes(size_t max_expert_bytes, size_t count, bool tinylfu) {
     if (!max_expert_bytes || !count) {
@@ -215,16 +404,21 @@ size_t llama_expert_cache::capacity_for_budget(size_t budget, size_t max_expert_
     return lower;
 }
 
-llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, read_fn reader, void * reader_context, bool tinylfu) :
+llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, read_fn reader, void * reader_context, bool tinylfu, bool prefetch_enabled) :
     reader(reader), reader_context(reader_context), max_expert_bytes(max_expert_bytes) {
     if (!reader) {
         throw std::invalid_argument("expert cache needs a reader");
     }
-    slot_count = capacity_for_budget(budget, max_expert_bytes, tinylfu);
+    const size_t extra = prefetch_enabled ? prefetch_bytes(max_expert_bytes) : 0;
+    if (budget < extra) {
+        throw std::invalid_argument("expert cache budget cannot fit prefetch buffer");
+    }
+    slot_count = capacity_for_budget(budget - extra, max_expert_bytes, tinylfu);
     const size_t stride = aligned_size(max_expert_bytes);
     static_assert(alignof(slot) <= slot_alignment, "slot metadata must fit in the aligned allocation");
     static_assert(std::is_trivially_destructible<slot>::value, "slot destruction must not require a loop");
-    counters.peak_allocated_bytes = required_bytes(max_expert_bytes, slot_count, tinylfu);
+    const size_t base = required_bytes(max_expert_bytes, slot_count, tinylfu);
+    counters.peak_allocated_bytes = base + extra;
     auto * allocation = ::operator new(counters.peak_allocated_bytes - sizeof(*this), std::align_val_t(slot_alignment));
     // The standard non-allocating placement array form has zero overhead (CWG 2382).
     slots = ::new (allocation) slot[slot_count]();
@@ -246,9 +440,33 @@ llama_expert_cache::llama_expert_cache(size_t budget, size_t max_expert_bytes, r
         stats.slot_stride = stride;
         std::fill_n(frequency->cells, stats.sketch_bytes, 0);
     }
+    if (prefetch_enabled) {
+        auto * storage = static_cast<unsigned char *>(allocation) + base - sizeof(*this);
+        pending = ::new (storage) prefetch_state{};
+        pending->data = storage + aligned_size(sizeof(prefetch_state));
+        pending->stats.payload_bytes = stride;
+        pending->stats.management_bytes = aligned_size(sizeof(prefetch_state));
+        try {
+            pending->thread = std::thread(&llama_expert_cache::prefetch_loop, this);
+        } catch (...) {
+            pending->~prefetch_state();
+            ::operator delete(allocation, std::align_val_t(slot_alignment));
+            throw;
+        }
+    }
 }
 
 llama_expert_cache::~llama_expert_cache() {
+    if (pending) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            pending->stopping = true;
+            discard_prefetch();
+        }
+        changed.notify_all();
+        pending->thread.join();
+        pending->~prefetch_state();
+    }
     assert(counters.pinned_slots == 0 && counters.waiting_requests == 0);
 #ifndef NDEBUG
     for (size_t i = 0; i < slot_count; ++i) {
@@ -354,7 +572,7 @@ bool llama_expert_cache::release(slot & storage, uint64_t generation) noexcept {
     return true;
 }
 
-llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) {
+llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes, const void * scope) {
     if (expert.expert_id < 0 || !bytes || bytes > max_expert_bytes) {
         return {};
     }
@@ -412,6 +630,10 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
             if (frequency) {
                 outcome.aged = frequency->observations == frequency->period;
                 frequency->observe(expert);
+            }
+            if (pending && scope && pending->scope == scope) {
+                discard_prefetch();
+                changed.notify_all();
             }
             auto result = pin(current);
             if (result) {
@@ -472,13 +694,48 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes) 
     selected->status = slot::state::loading;
     ++selected->generation;
     ++counters.cache_misses;
-    ++counters.disk_reads;
     if (frequency && frequency->trace) {
         frequency->trace(frequency->trace_context, outcome);
     }
     if (trace) {
         trace(trace_context, expert.tensor_source_id, expert.expert_id, bytes, false, selected - slots);
     }
+    if (pending && scope && pending->scope == scope) {
+        auto & job = *pending;
+        if (same_key(expert, job.expert) && bytes == job.bytes && !job.discard) {
+            const bool waited = job.status == prefetch_state::state::queued || job.status == prefetch_state::state::reading;
+            if (waited) {
+                const auto wait_start = cache_clock::now();
+                ++job.stats.wait_count;
+                changed.wait(lock, [&] {
+                    return job.status != prefetch_state::state::queued && job.status != prefetch_state::state::reading;
+                });
+                job.stats.wait_ns += elapsed_ns(wait_start);
+            }
+            if (job.status == prefetch_state::state::ready) {
+                // Slot metadata and generations keep their identity. Only unpinned payloads swap.
+                std::swap(selected->data, job.data);
+                if (waited) {
+                    ++job.stats.consumed_waited;
+                } else {
+                    ++job.stats.consumed_ready;
+                }
+                if (job.delivery) {
+                    job.delivery(job.delivery_context, job.stats.issued, waited);
+                }
+                job.status = prefetch_state::state::empty;
+                job.scope = nullptr;
+                selected->status = slot::state::ready;
+                auto result = pin(*selected);
+                changed.notify_all();
+                return result;
+            }
+            ++job.stats.fallback_reads;
+        }
+        discard_prefetch();
+        changed.notify_all();
+    }
+    ++counters.disk_reads;
     lock.unlock();
 
     const auto start = cache_clock::now();

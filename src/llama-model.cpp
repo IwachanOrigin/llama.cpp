@@ -1413,11 +1413,11 @@ struct llama_external_experts {
             lease_available.notify_one();
         }
 
-        ggml_cpu_external_expert_lease acquire(llama_expert_cache::key key, size_t bytes) {
+        ggml_cpu_external_expert_lease acquire(llama_expert_cache::key key, size_t bytes, const void * scope) {
             auto & record = reserve_lease();
             auto pin = llama_expert_cache::lease{};
             try {
-                pin = cache->acquire(key, bytes);
+                pin = cache->acquire(key, bytes, scope);
             } catch (...) {
                 release_lease(record, record.generation);
                 throw;
@@ -1446,8 +1446,8 @@ struct llama_external_experts {
                 static_cast<uint64_t>(expert) <= (SIZE_MAX - offset) / stride;
         }
 
-        void read(int64_t expert, void * dst, size_t bytes) const {
-            owner->files.at(shard)->read_exact_at(offset + static_cast<size_t>(expert) * stride, dst, bytes);
+        void read(int64_t expert, void * dst, size_t bytes, llama_file_read_sample * sample = nullptr) const {
+            owner->files.at(shard)->read_exact_at(offset + static_cast<size_t>(expert) * stride, dst, bytes, sample);
         }
 
         void log_error(int64_t expert, const char * message) const {
@@ -1456,6 +1456,11 @@ struct llama_external_experts {
         }
 
         static ggml_cpu_external_expert_lease acquire(void * context, int64_t expert, size_t bytes) noexcept {
+            return acquire_scoped(context, expert, bytes, nullptr);
+        }
+
+        static ggml_cpu_external_expert_lease acquire_scoped(void * context, int64_t expert, size_t bytes,
+                                                              const void * scope) noexcept {
             auto & source = *static_cast<tensor_source *>(context);
             auto & owner = *source.owner;
             if (!source.valid(expert, bytes)) {
@@ -1463,7 +1468,7 @@ struct llama_external_experts {
             }
             try {
                 if (owner.lru) {
-                    return owner.lru->acquire({source.id, expert}, bytes);
+                    return owner.lru->acquire({source.id, expert}, bytes, scope);
                 }
                 if (bytes > owner.slot.size()) {
                     return {};
@@ -1492,6 +1497,23 @@ struct llama_external_experts {
             }
         }
 
+        static llama_expert_cache & cache(void * context) {
+            return *static_cast<tensor_source *>(context)->owner->lru->cache;
+        }
+
+        inline static const ggml_cpu_external_expert_prefetch prefetch_ops{
+            acquire_scoped,
+            [](void * context, const void * scope, int64_t expert, size_t bytes) {
+                auto & source = *static_cast<tensor_source *>(context);
+                if (source.valid(expert, bytes)) {
+                    cache(context).try_prefetch(scope, {source.id, expert}, bytes);
+                }
+            },
+            [](void * context) { return cache(context).compute_begin(); },
+            [](void * context, const void * scope, uint64_t begin) { cache(context).compute_end(scope, begin); },
+            [](void * context, const void * scope) { cache(context).finish_prefetch(scope); },
+        };
+
         static void release(void * context, ggml_cpu_external_expert_lease lease) noexcept {
             auto & owner = *static_cast<tensor_source *>(context)->owner;
             if (owner.lru) {
@@ -1507,6 +1529,9 @@ struct llama_external_experts {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
     }
 
+    llama_expert_io_trace_fn io_trace = nullptr;
+    void * io_trace_context = nullptr;
+
     static bool read_expert(void * context, llama_expert_cache::key key, void * dst, size_t bytes) {
         auto & owner = *static_cast<llama_external_experts *>(context);
         if (key.tensor_source_id >= owner.source_count) {
@@ -1516,14 +1541,36 @@ struct llama_external_experts {
         if (!source.valid(key.expert_id, bytes) || source.shard >= owner.files.size()) {
             return false;
         }
+        const auto stamp = [] {
+            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                clock::now().time_since_epoch()).count());
+        };
+        const auto callback = owner.io_trace;
+        llama_expert_io_sample sample{};
+        if (callback) {
+            sample.source = key.tensor_source_id;
+            sample.expert = key.expert_id;
+            sample.shard = source.shard;
+            sample.offset = source.offset + size_t(key.expert_id) * source.stride;
+            sample.bytes = bytes;
+            sample.begin_ns = stamp();
+            sample.prefetch_id = llama_expert_cache::prefetch_reader_id();
+        }
         try {
             std::lock_guard<std::mutex> lock(owner.lru->shard_mutexes[source.shard]);
-            source.read(key.expert_id, dst, bytes);
-            return true;
+            if (callback) {
+                sample.wait_ns = stamp() - sample.begin_ns;
+            }
+            source.read(key.expert_id, dst, bytes, callback ? &sample.file : nullptr);
+            sample.success = true;
         } catch (const std::exception & e) {
             source.log_error(key.expert_id, e.what());
-            return false;
         }
+        if (callback) {
+            sample.end_ns = stamp();
+            callback(owner.io_trace_context, sample);
+        }
+        return sample.success;
     }
 
     static void account(size_t & total, size_t count, size_t size) {
@@ -1533,7 +1580,7 @@ struct llama_external_experts {
         total += count * size;
     }
 
-    void prepare(size_t budget, size_t max_slice, size_t count, const llama_files & shards, bool no_alloc, bool tinylfu) {
+    void prepare(size_t budget, size_t max_slice, size_t count, const llama_files & shards, bool no_alloc, bool tinylfu, bool prefetch) {
         size_t overhead = sizeof(*this);
         account(overhead, 1, sizeof(ggml_backend_buffer));
         account(overhead, count, sizeof(tensor_source));
@@ -1554,8 +1601,12 @@ struct llama_external_experts {
                 throw std::runtime_error("external Expert cache budget does not fit one slot and provider metadata");
             }
             cache_budget = budget - overhead;
-            slots = llama_expert_cache::capacity_for_budget(cache_budget, max_slice, tinylfu);
-            planned_bytes = overhead + llama_expert_cache::required_bytes(max_slice, slots, tinylfu);
+            const size_t extra = prefetch ? llama_expert_cache::prefetch_bytes(max_slice) : 0;
+            if (extra >= cache_budget) {
+                throw std::invalid_argument("Pager budget cannot fit Expert prefetch storage");
+            }
+            slots = llama_expert_cache::capacity_for_budget(cache_budget - extra, max_slice, tinylfu);
+            planned_bytes = overhead + extra + llama_expert_cache::required_bytes(max_slice, slots, tinylfu);
         } else {
             account(planned_bytes, 1, max_slice);
         }
@@ -1566,7 +1617,7 @@ struct llama_external_experts {
             if (budget) {
                 lru = std::make_unique<lru_state>();
                 lru->shard_mutexes = std::make_unique<std::mutex[]>(shards.size());
-                lru->cache = std::make_unique<llama_expert_cache>(cache_budget, max_slice, read_expert, this, tinylfu);
+                lru->cache = std::make_unique<llama_expert_cache>(cache_budget, max_slice, read_expert, this, tinylfu, prefetch);
                 allocated_bytes = overhead + lru->cache->stats().peak_allocated_bytes;
             } else {
                 slot.resize(max_slice);
@@ -1591,6 +1642,9 @@ struct llama_external_experts {
             " lease_wait_ns=%" PRIu64 " peak_allocated_bytes=%zu\n",
             stats.cache_hits, stats.cache_misses, stats.cache_evictions, stats.disk_reads, stats.bytes_read,
             stats.io_wait_ns, stats.cache_wait_ns, stats.capacity_wait_ns, lru ? lru->lease_wait_ns : 0, allocated_bytes);
+        if (lru) {
+            lru->cache.reset(); // Join before destroying shard locks, sources or files.
+        }
     }
 
     std::mutex mutex;
@@ -2337,7 +2391,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 logical_bytes += bytes;
                 ++source_count;
             }
-            external.prepare(params.external_expert_cache_size, slot_bytes, source_count, ml.files, ml.no_alloc, pager_tinylfu);
+            external.prepare(params.external_expert_cache_size, slot_bytes, source_count, ml.files, ml.no_alloc, pager_tinylfu, pager_prefetch);
             size_t source_id = 0;
             for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
                 const auto & weight = ml.require_weight(t->name);
@@ -2349,6 +2403,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 source.stride = t->nb[2];
                 source.count = t->ne[2];
                 source.type = t->type;
+                if (pager_prefetch) {
+                    source.provider.prefetch = &llama_external_experts::tensor_source::prefetch_ops;
+                }
                 t->buffer = external_buffer.get();
                 t->extra = &source.provider;
             }
@@ -2897,6 +2954,25 @@ bool llama_model::no_alloc() const {
     return params.no_alloc;
 }
 
+llama_expert_cache::prefetch_statistics llama_model::expert_prefetch_metrics() const {
+    return pimpl->external_experts && pimpl->external_experts->lru ?
+        pimpl->external_experts->lru->cache->prefetch_stats() : llama_expert_cache::prefetch_statistics{};
+}
+
+llama_expert_cache::prefetch_statistics llama_get_expert_prefetch_metrics(const llama_model * model) {
+    return model->expert_prefetch_metrics();
+}
+
+void llama_model::set_expert_prefetch_delivery_trace(llama_expert_cache::delivery_fn callback, void * context) {
+    if (pimpl->external_experts && pimpl->external_experts->lru) {
+        pimpl->external_experts->lru->cache->set_prefetch_delivery_trace(callback, context);
+    }
+}
+
+void llama_set_expert_prefetch_delivery_trace(llama_model * model, llama_expert_cache::delivery_fn callback, void * context) {
+    model->set_expert_prefetch_delivery_trace(callback, context);
+}
+
 llama_pager_metrics llama_model::pager_metrics() const {
     if (!pimpl->external_experts) {
         return {};
@@ -2925,6 +3001,9 @@ size_t llama_model::pager_budget_for_slots(size_t slots) const {
     auto & pager = *pimpl->external_experts;
     size_t total = pager.lru_overhead;
     llama_external_experts::account(total, 1, llama_expert_cache::required_bytes(pager.max_expert_bytes, slots, pager_tinylfu));
+    if (pager_prefetch) {
+        llama_external_experts::account(total, 1, llama_expert_cache::prefetch_bytes(pager.max_expert_bytes));
+    }
     return total;
 }
 
@@ -2936,6 +3015,17 @@ void llama_set_pager_decision_trace(llama_model * model, llama_expert_cache::dec
 void llama_model::set_pager_decision_trace(llama_expert_cache::decision_fn callback, void * context) {
     if (pimpl->external_experts && pimpl->external_experts->lru) {
         pimpl->external_experts->lru->cache->set_decision_trace(callback, context);
+    }
+}
+
+void llama_set_expert_io_trace(llama_model * model, llama_expert_io_trace_fn callback, void * context) {
+    model->set_expert_io_trace(callback, context);
+}
+
+void llama_model::set_expert_io_trace(llama_expert_io_trace_fn callback, void * context) {
+    if (pimpl->external_experts) {
+        pimpl->external_experts->io_trace_context = context;
+        pimpl->external_experts->io_trace = callback;
     }
 }
 

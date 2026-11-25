@@ -1,6 +1,15 @@
 #pragma once
 
 #include <cstdint>
+
+struct llama_file_read_sample {
+    uint64_t read_api_ns = 0;
+    uint64_t read_api_calls = 0;
+    uint64_t read_api_bytes = 0;
+    bool read_api_measured = false;
+};
+
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -30,7 +39,7 @@ struct llama_file {
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);
-    void read_exact_at(size_t offset, void * ptr, size_t len);
+    void read_exact_at(size_t offset, void * ptr, size_t len, llama_file_read_sample * sample = nullptr);
     size_t retained_bytes() const;
     void read_raw_unsafe(void * ptr, size_t len);
     void read_aligned_chunk(void * dest, size_t size);

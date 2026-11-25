@@ -402,12 +402,132 @@ void test_tinylfu_transient(file_source & files) {
     GGML_ASSERT(!c.policy_stats().transient_in_use && c.stats().pinned_slots == 0);
 }
 
+void test_prefetch(file_source & files, bool tinylfu) {
+    const auto budget = cache::required_bytes(expert_bytes, 2, tinylfu) + cache::prefetch_bytes(expert_bytes);
+    cache c(budget, expert_bytes, file_source::read, &files, tinylfu, true);
+    GGML_ASSERT(c.stats().peak_allocated_bytes == budget && c.capacity() == 2);
+    const cache::key first{0, 0}, next{0, 1};
+    const int scope = 0, other_scope = 0;
+    auto current = c.acquire(first, expert_bytes, &scope);
+    const auto begin = c.compute_begin();
+    files.pause(0, next);
+    c.try_prefetch(&scope, next, expert_bytes);
+    files.wait_for_read(0); // Reader entered before the current compute interval ends.
+    c.try_prefetch(&scope, next, expert_bytes);
+    c.try_prefetch(&other_scope, {0, 2}, expert_bytes);
+    verify(current, first);
+    c.compute_end(&scope, begin);
+    GGML_ASSERT(c.stats().cache_misses == 1);
+    GGML_ASSERT(c.policy_stats().updates == (tinylfu ? 1u : 0u));
+    current.reset();
+    auto demand = std::async(std::launch::async, [&] { return c.acquire(next, expert_bytes, &scope); });
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!c.prefetch_stats().wait_count) {
+        GGML_ASSERT(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+    }
+    files.resume(0);
+    auto following = get(demand);
+    verify(following, next);
+    auto stats = c.prefetch_stats();
+    GGML_ASSERT(stats.overlap_ns > 0 && stats.overlap_ns <= stats.reader_ns);
+    GGML_ASSERT(stats.issued == 1 && stats.duplicates == 1 && stats.skipped_busy == 1);
+    GGML_ASSERT(stats.consumed_waited == 1 && stats.in_use == 0 && c.stats().disk_reads == 2);
+    if (tinylfu) {
+        GGML_ASSERT(c.policy_stats().bypassed_misses == 1);
+    }
+    following.reset();
+    c.try_prefetch(&scope, first, expert_bytes);
+    if (tinylfu) {
+        GGML_ASSERT(c.prefetch_stats().skipped_resident == 1);
+    }
+    c.finish_prefetch(&scope);
+    GGML_ASSERT(c.prefetch_stats().in_use == 0 && !c.stats().pinned_slots);
+}
+
+void test_prefetch_failure(file_source & files) {
+    const size_t budget = cache::required_bytes(expert_bytes, 1) + cache::prefetch_bytes(expert_bytes);
+    try {
+        cache too_small(budget - 1, expert_bytes, file_source::read, &files, false, true);
+        GGML_ASSERT(false);
+    } catch (const std::invalid_argument &) {}
+    cache c(budget, expert_bytes, file_source::read, &files, false, true);
+    const cache::key next{1, 1};
+    const int scope = 0;
+    files.pause(0, next, file_source::outcome::short_read);
+    c.try_prefetch(&scope, next, expert_bytes);
+    files.wait_for_read(0);
+    files.resume(0);
+    verify(c.acquire(next, expert_bytes, &scope), next);
+    auto stats = c.prefetch_stats();
+    GGML_ASSERT(stats.reads_failed == 1 && stats.fallback_reads == 1 && !stats.in_use);
+    GGML_ASSERT(c.stats().disk_reads == 2 && c.stats().bytes_read == expert_bytes);
+
+    const cache::key abandoned{2, 0};
+    files.pause(0, abandoned);
+    c.try_prefetch(&scope, abandoned, expert_bytes);
+    files.wait_for_read(0);
+    auto drain = std::async(std::launch::async, [&] {
+        c.finish_prefetch(&scope);
+        return true;
+    });
+    files.resume(0);
+    GGML_ASSERT(get(drain));
+    stats = c.prefetch_stats();
+    GGML_ASSERT(stats.discarded_bytes == expert_bytes && !stats.in_use);
+}
+
+void test_prefetch_and_fallback_fail(file_source & files) {
+    struct failing_reader {
+        file_source & files;
+        std::atomic<unsigned> requests{0};
+    } reader{files};
+    const size_t budget = cache::required_bytes(expert_bytes, 1) + cache::prefetch_bytes(expert_bytes);
+    cache c(budget, expert_bytes, [](void * context, cache::key expert, void * dst, size_t bytes) {
+        auto & source = *static_cast<failing_reader *>(context);
+        return source.requests++ >= 2 && file_source::read(&source.files, expert, dst, bytes);
+    }, &reader, false, true);
+    const cache::key expert{1, 4};
+    const int scope = 0;
+    c.try_prefetch(&scope, expert, expert_bytes);
+    GGML_ASSERT(!c.acquire(expert, expert_bytes, &scope));
+    GGML_ASSERT(c.prefetch_stats().fallback_reads == 1 && !c.prefetch_stats().in_use);
+    GGML_ASSERT(c.stats().disk_reads == 2 && !c.stats().pinned_slots);
+    verify(c.acquire(expert, expert_bytes, &scope), expert);
+}
+
+void test_prefetch_shutdown(file_source & files) {
+    const auto allocated = aligned_blocks.load();
+    const size_t budget = cache::required_bytes(expert_bytes, 1) + cache::prefetch_bytes(expert_bytes);
+    auto c = std::make_unique<cache>(budget, expert_bytes, file_source::read, &files, false, true);
+    const cache::key key{2, 1};
+    const int scope = 0;
+    files.pause(0, key);
+    c->try_prefetch(&scope, key, expert_bytes);
+    files.wait_for_read(0);
+    std::promise<void> destroying;
+    auto entered = destroying.get_future();
+    auto shutdown = std::async(std::launch::async, [owned = std::move(c), &destroying]() mutable {
+        destroying.set_value();
+        owned.reset();
+        return true;
+    });
+    GGML_ASSERT(entered.wait_for(timeout) == std::future_status::ready);
+    GGML_ASSERT(aligned_blocks.load() == allocated + 1);
+    files.resume(0);
+    GGML_ASSERT(get(shutdown) && aligned_blocks.load() == allocated);
+}
 } // namespace
 
 int main(int argc, char ** argv) {
     GGML_ASSERT(argc == 2);
     file_source files(argv[1]);
     test_budget_and_lru(files);
+    test_prefetch(files, false);
+    test_prefetch(files, true);
+    test_prefetch_failure(files);
+    test_prefetch_shutdown(files);
+    test_prefetch_and_fallback_fail(files);
     test_tinylfu_reference(files);
     test_tinylfu_transient(files);
     test_same_key_and_pins(files);

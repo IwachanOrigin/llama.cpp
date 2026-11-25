@@ -273,7 +273,7 @@ def generation(exe, model, root, label):
     verify(phases["decode"]["worker_reads"] > 0, "worker Pager counters were not recorded")
     traced = root / "trace-baseline"
     run(command(exe, "baseline", model, 0, "mmap", traced, label) + options +
-        ["--expert-trace-limit", "10000"], root / "trace-baseline.log")
+        ["--expert-io-trace-limit", "10000", "--perf-details"], root / "trace-baseline.log")
     verify(traced.with_suffix(".generated_tokens").read_bytes() == a and
            traced.with_suffix(".generated.txt").read_bytes() == baseline.with_suffix(".generated.txt").read_bytes(),
            "Expert tracing changed generation")
@@ -282,18 +282,47 @@ def generation(exe, model, root, label):
     verify(len(trace["requests"]) == 5 and trace["trace_metadata"]["dropped"] == 0 and
            sum(row["hits"] + row["misses"] for row in trace["requests"]) == trace["trace_metadata"]["events"],
            "Expert trace requests do not reconcile")
+    io_analysis = runpy.run_path(str(Path(__file__).with_name("analyze-expert-io.py")))
+    inventory = io_analysis["inventory"]([Path(model)])
+    io = io_analysis["analyze"](traced.with_suffix(".experts.jsonl"), inventory)
+    verify(io["reads"] > 0 and io["timed_reader_trace"], "Expert I/O trace is missing")
+    if sys.platform == "win32":
+        verify(io["read_api_calls"] == io["reads"] and io["read_api_bytes"] == io["requested_bytes"],
+               "ReadFile counters differ from Expert reader")
+    limited = root / "trace-limited"
+    run(command(exe, "baseline", model, 0, "mmap", limited, label) + options +
+        ["--expert-io-trace-limit", "2", "--perf-details"], root / "trace-limited.log")
+    with limited.with_suffix(".expert-io.jsonl").open() as stream:
+        summary = json.loads(next(stream))
+        verify(summary["dropped"] > 0 and summary["access_dropped"] > 0 and sum(1 for _ in stream) == 2,
+               "Expert I/O trace cap was not enforced")
+    verify(limited.with_suffix(".generated_tokens").read_bytes() == a, "truncation changed generation")
     tinylfu = root / "trace-tinylfu"
     run(command(exe, "baseline", model, 0, "mmap", tinylfu, label) + options +
-        ["--pager-policy", "tinylfu", "--pager-budget-mib", "2", "--expert-trace-limit", "10000", "--perf-details"],
+        ["--pager-policy", "tinylfu", "--pager-budget-mib", "2", "--expert-io-trace-limit", "10000",
+         "--expert-prefetch-depth", "1", "--perf-details"],
         root / "trace-tinylfu.log")
     for suffix in (".generated_tokens", ".generated.txt"):
         verify(tinylfu.with_suffix(suffix).read_bytes() == baseline.with_suffix(suffix).read_bytes(),
                "TinyLFU changed generation")
     simulation = runpy.run_path(str(Path(__file__).with_name("simulate-pager-policies.py")))
     replay = simulation["verify_tinylfu"](tinylfu.with_suffix(".experts.jsonl"))
-    pager = json.loads(tinylfu.with_suffix(".metrics.json").read_text())["pager"]
-    verify(replay["misses"] == pager["disk_reads"] and replay["events"] == pager["frequency_updates"] and
+    tiny_metrics = json.loads(tinylfu.with_suffix(".metrics.json").read_text())
+    pager = tiny_metrics["pager"]
+    decoded_io = io_analysis["analyze"](tinylfu.with_suffix(".experts.jsonl"), inventory)["prefetch_io"]
+    verify(decoded_io["consumed"] > 0 and tiny_metrics["prefetch"]["overlap_ns"] > 0 and
+           tiny_metrics["prefetch"]["in_use"] == 0, "prefetch I/O was not delivered during generation")
+    verify(replay["misses"] == pager["cache_misses"] and replay["events"] == pager["frequency_updates"] and
            replay["bypassed"] > 0 and not pager["transient_in_use"], "TinyLFU metrics differ from replay")
+    one_thread = []
+    for depth in ("0", "1"):
+        sample = root / ("one-thread-depth-" + depth)
+        run(command(exe, "baseline", model, 0, "mmap", sample, label) + options +
+            ["--threads", "1", "--pager-policy", "tinylfu", "--pager-budget-mib", "2",
+             "--expert-prefetch-depth", depth], root / (sample.name + ".log"))
+        one_thread.append(tuple(sample.with_suffix(suffix).read_bytes()
+                                for suffix in (".generated_tokens", ".generated.txt")))
+    verify(one_thread[0] == one_thread[1], "prefetch changed one-thread generation")
     with profiled.with_suffix(".perf.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     verify(len(rows) == 5 and all(row["receive_bytes"] == "" for row in rows) and
@@ -392,11 +421,15 @@ def main(exe, single, split, logs=None):
                 if io == "mmap":
                     tiny = path / "tinylfu"
                     tiny.mkdir()
-                    distributed(exe, model, io, tiny, label, ["--pager-policy", "tinylfu", "--pager-budget-mib", "2"])
+                    distributed(exe, model, io, tiny, label, ["--pager-policy", "tinylfu", "--pager-budget-mib", "2",
+                                                              "--expert-io-trace-limit", "10000", "--expert-prefetch-depth", "1"])
                     names = (".boundary", ".logits", ".ffn_moe_topk-0", ".ffn_moe_topk-1")
                     for suffix in names:
                         verify((tiny / ("baseline" + suffix)).read_bytes() == (path / ("baseline" + suffix)).read_bytes(),
                                f"TinyLFU changed fixed-token {suffix}")
+                    for name in ("front.logits", "front.ffn_moe_topk-0", "back.ffn_moe_topk-1"):
+                        verify((tiny / name).read_bytes() == (path / name).read_bytes(),
+                               f"prefetch changed distributed fixed-token {name}")
             if index == 0:
                 path = root / "faults"
                 path.mkdir()

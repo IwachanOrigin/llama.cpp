@@ -24,7 +24,7 @@ def compare_folders(folders):
     outputs = None
     conditions = ("revision", "version", "model_identity", "identity_source", "context", "effective_context",
                   "batch", "threads", "io", "split", "layers", "hidden", "vocab", "cache_state_label",
-                  "chat", "max_new_tokens", "prompt_token_sha256")
+                  "chat", "max_new_tokens", "prompt_token_sha256", "expert_prefetch_depth")
     for index, path in enumerate(folders, 1):
         record = {"order": index, "folder": str(path)}
         ordered.append(record)
@@ -43,7 +43,8 @@ def compare_folders(folders):
             if reference is None:
                 reference, outputs = measured, hashes
             capacity = base["pager_budget_mib"]
-            record.update(status="ok", pager_policy=base["pager_policy"], budget_mib=capacity, byte_match=True, output_sha256=hashes)
+            record.update(status="ok", pager_policy=base["pager_policy"], expert_prefetch_depth=base["expert_prefetch_depth"],
+                          budget_mib=capacity, byte_match=True, output_sha256=hashes)
             for data in values:
                 pager, memory, generation = data["pager"], data.get("process_memory") or {}, data.get("generation", {})
                 grouped[base["pager_policy"], capacity, data["role"]].append({
@@ -55,6 +56,9 @@ def compare_folders(folders):
                         "resident_slots", "transient_slots", "sketch_bytes", "policy_management_bytes",
                         "admitted_misses", "bypassed_misses", "admission_comparisons", "admission_rejections",
                         "frequency_updates", "frequency_aging_count", "transient_waits", "transient_wait_ns")},
+                    **{"prefetch_" + key: (data.get("prefetch") or {}).get(key) for key in (
+                        "slots", "payload_bytes", "management_bytes", "reads_started", "consumed", "consumed_ready",
+                        "consumed_waited", "wait_ns", "discarded_bytes", "overlap_ns", "reader_ns", "copy_bytes")},
                     **{key: memory.get(key) for key in ("peak_working_set_bytes", "private_commit_bytes", "peak_rss_bytes")},
                     "stage_execution_wall_ms": data["stage"]["stage_execution_wall_ms"],
                     **{phase + "_reads": phases[phase]["worker_reads"] if data["role"] == "worker"
