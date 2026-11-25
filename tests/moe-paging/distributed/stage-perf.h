@@ -22,6 +22,29 @@ struct stage_performance {
         bool pager_valid = false;
         llama_pager_metrics pager{};
     };
+    struct transfer_detail {
+        double first_byte_ms = 0, header_ms = 0, payload_ms = 0;
+        uint64_t calls = 0, partial = 0, retries = 0;
+        json encode() const {
+            return {{"first_byte_ms", first_byte_ms}, {"header_ms", header_ms}, {"payload_ms", payload_ms},
+                    {"calls", calls}, {"partial", partial}, {"retries", retries}};
+        }
+    };
+    struct tcp_detail {
+        uint32_t request;
+        transfer_detail sent, received;
+        double copy_ms;
+        uint64_t copy_bytes;
+    };
+    bool detail_enabled = false;
+    static constexpr size_t detail_limit = 4096;
+    std::vector<tcp_detail> communication;
+    void add_communication(tcp_detail entry) {
+        if (communication.size() < detail_limit) {
+            communication.push_back(entry);
+        }
+    }
+
     json summary = json::object();
     std::vector<row> rows;
     std::string prefix;
@@ -127,6 +150,18 @@ struct stage_performance {
         summary["tcp"] = {{"sent_bytes", sent}, {"received_bytes", received}, {"send_wall_ms", send_ms},
                           {"receive_wall_ms", receive_ms}, {"timeouts", timeouts}, {"transport_errors", transport_errors},
                           {"session_errors", session_errors}, {"request_rows", rows.size()}};
+        if (detail_enabled) {
+            summary["tcp_detail"] = {{"schema_version", 1}, {"limit", detail_limit},
+                {"reserved_bytes", communication.capacity() * sizeof(tcp_detail)},
+                {"complete", success && (summary["role"] == "baseline" || communication.size() == rows.size())},
+                {"requests", json::array()}};
+            for (const auto & entry : communication) {
+                summary["tcp_detail"]["requests"].push_back({{"request_id", entry.request},
+                    {"send", entry.sent.encode()}, {"receive", entry.received.encode()},
+                    {"last_logits_copy_ms", entry.copy_ms < 0 ? json(nullptr) : json(entry.copy_ms)},
+                    {"last_logits_copy_bytes", entry.copy_bytes}});
+            }
+        }
         if (!summary.contains("process_memory")) summary["process_memory"] = process_memory();
         std::ofstream csv(std::filesystem::u8path(prefix + ".perf.csv"), std::ios::binary);
         csv.exceptions(std::ios::badbit | std::ios::failbit);

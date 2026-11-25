@@ -45,6 +45,8 @@ inline void close(handle fd) { ::close(fd); }
 struct runtime {};
 #endif
 
+struct transfer_counts { uint64_t calls = 0, partial = 0, retries = 0; };
+
 struct socket {
     handle fd = invalid;
     explicit socket(handle value = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) : fd(value) {
@@ -87,7 +89,7 @@ struct socket {
         }
     }
 
-    void transfer(uint8_t * bytes, size_t length, bool writing, clock::time_point deadline, uint64_t & total) {
+    void transfer(uint8_t * bytes, size_t length, bool writing, clock::time_point deadline, uint64_t & total, transfer_counts * counts = nullptr) {
         while (length) {
             wait(writing, deadline);
             const int chunk = int(length > 65536 ? 65536 : length);
@@ -98,6 +100,11 @@ struct socket {
 #endif
             const int moved = writing ? ::send(fd, reinterpret_cast<const char *>(bytes), chunk, flags)
                                       : ::recv(fd, reinterpret_cast<char *>(bytes), chunk, 0);
+            if (counts) {
+                ++counts->calls;
+                if (moved > 0 && moved < chunk) ++counts->partial;
+                if (moved < 0 && retry(error())) ++counts->retries;
+            }
             if (moved == 0) throw std::runtime_error("peer closed during frame");
             if (moved < 0) {
                 if (retry(error())) continue;

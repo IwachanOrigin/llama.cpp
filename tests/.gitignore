@@ -19,6 +19,9 @@ moe-paging/distributed/*
 !moe-paging/distributed/simulate-pager-policies.py
 !moe-paging/distributed/test-pager-policies.py
 !moe-paging/distributed/analyze-stage-performance.py
+!moe-paging/distributed/analyze-stage-communication.py
+!moe-paging/distributed/test-stage-communication-analysis.py
+!moe-paging/distributed/benchmark-stage-transport.py
 !moe-paging/distributed/test-stage-tcp.py
 !moe-paging/distributed/prepare-stage-fixture.py
 !moe-paging/*.cpp

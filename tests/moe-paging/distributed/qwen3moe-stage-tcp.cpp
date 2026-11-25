@@ -93,22 +93,31 @@ struct channel {
     uint64_t sent = 0, received = 0;
     std::chrono::milliseconds frame_limit;
     stage_performance * perf;
+    stage_performance::transfer_detail last_send{}, last_receive{};
     explicit channel(stage_tcp::socket socket, uint32_t frame_ms, stage_performance * details)
         : peer(std::move(socket)), frame_limit(frame_ms), perf(details) {}
 
-    void transfer(uint8_t * data, size_t size, bool sending, steady_clock::time_point deadline) {
+    void transfer(uint8_t * data, size_t size, bool sending, steady_clock::time_point deadline, double stage_performance::transfer_detail::* part) {
         auto & count = sending ? sent : received;
         if (!perf) {
             peer.transfer(data, size, sending, deadline, count);
             return;
         }
         const auto start = steady_clock::now();
+        auto & detail = sending ? last_send : last_receive;
+        stage_tcp::transfer_counts calls;
         auto record = [&] {
+            if (perf->detail_enabled) {
+                detail.*part += stage_performance::elapsed(start);
+                detail.calls += calls.calls;
+                detail.partial += calls.partial;
+                detail.retries += calls.retries;
+            }
             (sending ? perf->send_ms : perf->receive_ms) += stage_performance::elapsed(start);
             (sending ? perf->sent : perf->received) = count;
         };
         try {
-            peer.transfer(data, size, sending, deadline, count);
+            peer.transfer(data, size, sending, deadline, count, perf->detail_enabled ? &calls : nullptr);
         } catch (const std::exception & error) {
             record();
             ++perf->transport_errors;
@@ -125,24 +134,28 @@ struct channel {
             put(header, value);
         }
         const auto deadline = steady_clock::now() + frame_limit;
-        transfer(header.data(), header.size(), true, deadline);
-        transfer(packet.body.data(), packet.body.size(), true, deadline);
+        if (perf && perf->detail_enabled) last_send = {};
+        transfer(header.data(), header.size(), true, deadline, &stage_performance::transfer_detail::header_ms);
+        transfer(packet.body.data(), packet.body.size(), true, deadline, &stage_performance::transfer_detail::payload_ms);
         std::fprintf(stderr, "tx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
     }
 
     frame receive(uint32_t response_ms = 0) {
+        if (perf && perf->detail_enabled) last_receive = {};
         bytes header(24);
         const size_t starting_bytes = response_ms ? 1 : 0;
         if (response_ms) {
             try {
-                transfer(header.data(), 1, false, steady_clock::now() + std::chrono::milliseconds(response_ms));
+                transfer(header.data(), 1, false, steady_clock::now() + std::chrono::milliseconds(response_ms),
+                         &stage_performance::transfer_detail::first_byte_ms);
             } catch (const std::runtime_error & error) {
                 throw std::runtime_error(std::string("awaiting Worker response: ") + error.what());
             }
         }
         const auto deadline = steady_clock::now() + frame_limit;
-        transfer(header.data() + starting_bytes, header.size() - starting_bytes, false, deadline);
+        transfer(header.data() + starting_bytes, header.size() - starting_bytes, false, deadline,
+                 &stage_performance::transfer_detail::header_ms);
         reader r{header};
         require(r.word() == magic, "bad protocol magic");
         require(r.word() == version, "unsupported protocol version");
@@ -151,7 +164,7 @@ struct channel {
         require(type >= hello && type <= ack, "unexpected message type");
         require(length <= cap, "invalid frame length");
         frame packet{type, r.word(), r.word(), bytes(length)};
-        transfer(packet.body.data(), packet.body.size(), false, deadline);
+        transfer(packet.body.data(), packet.body.size(), false, deadline, &stage_performance::transfer_detail::payload_ms);
         std::fprintf(stderr, "rx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
         if (type == error_message) {
@@ -184,6 +197,7 @@ struct options {
     bool chat = false;
     bool perf_details = false;
     uint32_t expert_trace_limit = 0;
+    bool tcp_perf_details = false;
     uint32_t expert_io_trace_limit = 0;
     uint32_t expert_prefetch_depth = 0;
     std::string pager_policy = "lru";
@@ -273,8 +287,9 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             cfg.chat = true;
             continue;
         }
-        if (key == "--perf-details") {
+        if (key == "--perf-details" || key == "--tcp-perf-details") {
             cfg.perf_details = true;
+            if (key == "--tcp-perf-details") cfg.tcp_perf_details = true;
             continue;
         }
         require(i + 1 < argc, "option requires a value");
@@ -683,6 +698,9 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         if (sample) {
             sample->send = perf->send_ms - send_before;
             sample->sent = wire.sent - sent_before;
+            if (perf->detail_enabled) {
+                perf->add_communication({request, wire.last_send, wire.last_receive, -1, 0});
+            }
         }
         position += count;
     }
@@ -927,9 +945,19 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
             require(r.word() == 0 && r.word() == count && r.word() == local.vocab, "invalid output shape or status");
             const auto remote_logits = floats(r, count, local.vocab);
             if (cfg.generate) {
+                const auto copy_start = perf && perf->detail_enabled ? steady_clock::now() : steady_clock::time_point{};
                 last.assign(remote_logits.end() - local.vocab, remote_logits.end());
+                if (perf && perf->detail_enabled) {
+                    perf->add_communication({request, wire->last_send, wire->last_receive,
+                        stage_performance::elapsed(copy_start), uint64_t(local.vocab) * sizeof(float)});
+                }
             } else {
+                const auto copy_start = perf && perf->detail_enabled ? steady_clock::now() : steady_clock::time_point{};
                 local.output.logits.insert(local.output.logits.end(), result.body.begin() + 12, result.body.end());
+                if (perf && perf->detail_enabled) {
+                    perf->add_communication({request, wire->last_send, wire->last_receive,
+                        stage_performance::elapsed(copy_start), result.body.size() - 12});
+                }
             }
             std::fprintf(stderr, "roundtrip request=%u tokens=%u ms=%.3f\n", request, count, ms);
             if (sample) sample->deserialize = stage_performance::elapsed(parse_start);
@@ -1041,6 +1069,10 @@ int main(int argc, char ** argv) {
             }
             perf = std::make_unique<stage_performance>();
             perf->prefix = cfg.output;
+            perf->detail_enabled = cfg.tcp_perf_details;
+            if (perf->detail_enabled && cfg.role != "baseline") {
+                perf->communication.reserve(stage_performance::detail_limit);
+            }
             perf->summary = {{"role", cfg.role}, {"revision", STAGE_BUILD_COMMIT}, {"version", llama_version()},
                 {"model_path", cfg.model}, {"identity_source", cfg.auto_identity ? "local-sha256" :
                         cfg.identity.empty() ? "metadata" : "label"},

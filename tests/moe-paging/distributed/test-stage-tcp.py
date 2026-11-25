@@ -370,7 +370,9 @@ def generation(exe, model, root, label):
                stats["stage"]["stage_execution_calls"] == 1, "missing failure diagnostics")
     print("autoregressive IDs, chunked prefill, limits, validation and failure publication verified")
 
-    for nonfinite in (None, float("nan"), float("inf")):
+    for scenario, winner, nonfinite in (("tie", 6, None), ("first", 0, None),
+            ("last", 127, None), ("negative", 42, None), ("nan", None, float("nan")),
+            ("inf", None, float("inf")), ("neg-inf", None, -float("inf")), ("width", None, None)):
         with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as pool:
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
@@ -385,27 +387,31 @@ def generation(exe, model, root, label):
                     verify(read_frame(conn)[0] == 2, "missing OPEN")
                     conn.sendall(frame(7, sid=1))
                     verify(read_frame(conn)[:3] == (3, 1, 1), "missing prompt request")
-                    logits = [0.0] * 128
-                    logits[6] = logits[7] = 1.0
+                    logits = [-2.0 if scenario == "negative" else 0.0] * 128
+                    if winner is not None:
+                        logits[winner] = -1.0 if scenario == "negative" else 1.0
+                    if scenario == "tie":
+                        logits[7] = 1.0
                     if nonfinite is not None:
                         logits[100] = nonfinite
-                    conn.sendall(frame(4, 1, 1, struct.pack("<3I128f", 0, 1, 128, *logits)))
-                    expected = 5 if nonfinite is None else 6
+                    conn.sendall(frame(4, 1, 1, struct.pack("<3I128f", 0, 1, 127 if scenario == "width" else 128, *logits)))
+                    expected = 5 if winner is not None else 6
                     verify(read_frame(conn)[0] == expected, "unexpected generation protocol outcome")
-                    if nonfinite is None:
+                    if winner is not None:
                         conn.sendall(frame(7, 1, 2))
 
             pending = pool.submit(scripted_worker)
-            output = root / ("tie" if nonfinite is None else f"reject-{nonfinite}")
+            output = root / ("greedy-" + scenario)
             log = run(command(exe, "coordinator", model, listener.getsockname()[1], "mmap", output, label) +
                       ["--generate", "--prompt-tokens", "1", "--max-new-tokens", "1"],
-                      output.with_suffix(".log"), expected=int(nonfinite is not None))
+                      output.with_suffix(".log"), expected=int(winner is None))
             pending.result(timeout=10)
-            if nonfinite is None:
-                verify(output.with_suffix(".generated_tokens").read_bytes() == struct.pack("<I", 6),
+            if winner is not None:
+                verify(output.with_suffix(".generated_tokens").read_bytes() == struct.pack("<I", winner),
                        "tie did not select the lowest maximum ID")
             else:
-                verify("non-finite" in log and not output.with_suffix(".generated_tokens").exists(),
+                verify(("invalid output shape" if scenario == "width" else "non-finite") in log
+                       and not output.with_suffix(".generated_tokens").exists(),
                        "non-finite logits were published")
     print("greedy maximum, lowest-ID tie and non-finite logits verified")
 
@@ -422,7 +428,7 @@ def main(exe, single, split, logs=None):
                     tiny = path / "tinylfu"
                     tiny.mkdir()
                     distributed(exe, model, io, tiny, label, ["--pager-policy", "tinylfu", "--pager-budget-mib", "2",
-                                                              "--expert-io-trace-limit", "10000", "--expert-prefetch-depth", "1"])
+                                                              "--expert-io-trace-limit", "10000", "--expert-prefetch-depth", "1", "--tcp-perf-details"])
                     names = (".boundary", ".logits", ".ffn_moe_topk-0", ".ffn_moe_topk-1")
                     for suffix in names:
                         verify((tiny / ("baseline" + suffix)).read_bytes() == (path / ("baseline" + suffix)).read_bytes(),
