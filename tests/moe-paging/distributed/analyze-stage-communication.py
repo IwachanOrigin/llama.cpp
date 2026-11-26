@@ -21,7 +21,7 @@ def distribution(values):
             "p99": ordered[math.ceil(.99 * len(ordered)) - 1], "max": ordered[-1], "total": sum(ordered)}
 
 
-def join(front, worker, hidden, vocab, prompt, generated):
+def join(front, worker, hidden, vocab, prompt, generated, compact=False):
     if (len(front) != len(worker) or not front or min(hidden, vocab, prompt, generated) <= 0):
         raise ValueError("invalid request counts or model dimensions")
     position = 0
@@ -39,8 +39,11 @@ def join(front, worker, hidden, vocab, prompt, generated):
         if (phase == "prefill" and position + count > prompt) or (phase == "decode" and count != 1):
             raise ValueError("invalid prefill/decode shape")
         hidden_bytes, logits_bytes = 4 * hidden * count, 4 * vocab * count
-        sent = HEADER + 16 + 4 * count + hidden_bytes
-        received = HEADER + 12 + logits_bytes
+        used = int(position + count >= prompt)
+        kind = (9 if used else 8) if compact else 4
+        sent = HEADER + 16 + 4 * count + hidden_bytes + 4 * compact
+        token_bytes = 4 * used if compact else 0
+        received = HEADER + 12 + (token_bytes if compact else logits_bytes)
         if sent != int(local["send_bytes"]) or sent != int(remote["receive_bytes"]) or (
                 received != int(local["receive_bytes"]) or received != int(remote["send_bytes"])):
             raise ValueError("request bytes do not match wire schema")
@@ -53,10 +56,11 @@ def join(front, worker, hidden, vocab, prompt, generated):
         # Blocking send/recv can overlap those intervals, so they are excluded here.
         residual = rtt - worker_stage
         unexplained = residual - timing["worker_deserialize_ms"] - timing["worker_serialize_ms"]
-        used = int(position + count >= prompt)
         requests.append({"request": index, "position": position, "phase": phase, "tokens": count,
                          "sent_bytes": sent, "received_bytes": received, "hidden_bytes": hidden_bytes,
                          "logits_bytes": logits_bytes, "logits_rows": count, "sampled_rows": used,
+                         "response_kind": kind, "token_id_bytes": token_bytes,
+                         "transmitted_logits_bytes": 0 if compact else logits_bytes,
                          "rtt_ms": rtt, "worker_stage_ms": worker_stage,
                          "rtt_minus_worker_ms": residual, "unexplained_ms": unexplained, **timing})
         position += count
@@ -82,7 +86,7 @@ def alternatives(rows, control_sent, control_received, vocab):
 
 
 def summarize(rows):
-    scalar = ("sent_bytes", "received_bytes", "hidden_bytes", "logits_bytes", "logits_rows", "sampled_rows")
+    scalar = ("sent_bytes", "received_bytes", "hidden_bytes", "logits_bytes", "logits_rows", "sampled_rows", "token_id_bytes", "transmitted_logits_bytes")
     return {"requests": len(rows), **{key: sum(row[key] for row in rows) for key in scalar},
             "unused_logits_rows": sum(row["logits_rows"] - row["sampled_rows"] for row in rows),
             "durations": {key: distribution([row[key] for row in rows])
@@ -92,7 +96,7 @@ def summarize(rows):
 def verify_frame_logs(folder, requests, hello_bytes):
     pattern = re.compile(r"^(tx|rx) type=(\d+) request=(\d+) header=(\d+) payload=(\d+)$", re.M)
     exchanges = [(1, 1, 0, hello_bytes, hello_bytes), (2, 7, 0, 0, 0)]
-    exchanges.extend((3, 4, row["request"], row["sent_bytes"] - HEADER, row["received_bytes"] - HEADER)
+    exchanges.extend((3, row["response_kind"], row["request"], row["sent_bytes"] - HEADER, row["received_bytes"] - HEADER)
                      for row in requests)
     exchanges.append((5, 7, len(requests) + 1, 0, 0))
     verified = []
@@ -120,13 +124,24 @@ def analyze(folder, connection):
     for role in ("coordinator", "worker"):
         with (folder / f"{role}.perf.csv").open(encoding="utf-8", newline="") as stream:
             csv_rows.append(list(csv.DictReader(stream)))
+    compact = front.get("protocol_version", 1) == 2
     rows = join(*csv_rows, front["hidden"], front["vocab"], front["prompt_tokens"],
-                front["generation"]["generated_tokens"])
+                front["generation"]["generated_tokens"], compact)
     sent = front["tcp"]["sent_bytes"] - sum(row["sent_bytes"] for row in rows)
     received = front["tcp"]["received_bytes"] - sum(row["received_bytes"] for row in rows)
     if sent != received or sent < 3 * HEADER + 44:
         raise ValueError("unexpected session control byte counts")
     verified_logs = verify_frame_logs(folder, rows, sent - 3 * HEADER)
+    if compact:
+        counters = worker["compact_responses"]
+        count = sum(row["logits_rows"] for row in rows)
+        selected = sum(row["sampled_rows"] for row in rows)
+        expected = {"status_only": len(rows) - selected, "greedy_token": selected,
+                    "computed_logits_rows": count, "validated_logits_rows": count,
+                    "transmitted_logits_rows": 0, "transmitted_token_ids": selected,
+                    "omitted_logits_bytes": count * front["vocab"] * 4}
+        if any(counters[key] != value for key, value in expected.items()):
+            raise ValueError("compact response counters disagree with schedule")
     diagnostic = {}
     for role, metrics in (("coordinator", front), ("worker", worker)):
         detail = metrics.get("tcp_detail")
@@ -144,7 +159,7 @@ def analyze(folder, connection):
                     raise ValueError("invalid diagnostic timing or transfer counter")
                 if values["calls"] < 2 or values["partial"] + values["retries"] > values["calls"]:
                     raise ValueError("invalid transfer-call accounting")
-            expected_copy = 4 * front["vocab"] if role == "coordinator" else 0
+            expected_copy = 4 * front["vocab"] if role == "coordinator" and not compact else 0
             if event["last_logits_copy_bytes"] != expected_copy:
                 raise ValueError("logits row copy bytes differ")
             row[role + "_tcp_detail"] = event
@@ -163,7 +178,7 @@ def analyze(folder, connection):
             "pager_budget_mib", "expert_prefetch_depth", "hidden", "vocab", "prompt_tokens", "binary_arch")},
         "control_bytes_per_direction": sent, "hello_payload_bytes": sent - 3 * HEADER,
         "request_frame_header_bytes": len(rows) * HEADER, "response_frame_header_bytes": len(rows) * HEADER,
-        "request_metadata_bytes": sum(16 + 4 * row["tokens"] for row in rows),
+        "request_metadata_bytes": sum(16 + 4 * row["tokens"] + 4 * compact for row in rows),
         "response_metadata_bytes": len(rows) * 12, "expert_id_wire_bytes": 0,
         "greedy_ms": front["generation"].get("greedy_ms"),
         "all": summarize(rows), "phases": {phase: summarize([row for row in rows if row["phase"] == phase])
@@ -172,11 +187,15 @@ def analyze(folder, connection):
         "logical_conversion_bytes": {
             "coordinator_hidden_encode": sum(r["hidden_bytes"] for r in rows),
             "worker_hidden_decode": sum(r["hidden_bytes"] for r in rows),
-            "worker_logits_encode": sum(r["logits_bytes"] for r in rows),
-            "coordinator_logits_decode": sum(r["logits_bytes"] for r in rows),
-            "coordinator_last_row_copy": len(rows) * 4 * front["vocab"],
+            "worker_logits_encode": sum(r["transmitted_logits_bytes"] for r in rows),
+            "coordinator_logits_decode": sum(r["transmitted_logits_bytes"] for r in rows),
+            "coordinator_last_row_copy": 0 if compact else len(rows) * 4 * front["vocab"],
         },
-        "diagnostic": diagnostic, "alternatives": alternatives(rows, sent, received, front["vocab"]),
+        "protocol_version": 2 if compact else 1,
+        "logits_response": front.get("logits_response", "full"),
+        "worker_compact_responses": worker.get("compact_responses"),
+        "diagnostic": diagnostic,
+        "alternatives": None if compact else alternatives(rows, sent, received, front["vocab"]),
         "requests": rows,
     }
 

@@ -53,6 +53,12 @@ def compare(paths):
     if [item["layer_range"] for item in values] != [[0, base["layers"]], [0, base["split"]],
                                                    [base["split"], base["layers"]]]:
         raise ValueError("inconsistent stage ranges")
+    mode = (front.get("protocol_version", 1), front.get("logits_response", "full"),
+            front.get("compact_capability", False))
+    peer_mode = (back.get("protocol_version", 1), back.get("logits_response", "full"),
+                 back.get("compact_capability", False))
+    if mode != peer_mode or mode not in ((1, "full", False), (2, "worker-greedy", True)):
+        raise ValueError("Stage protocol or negotiated response mode differs")
     if not front["session_id"] or front["session_id"] != back["session_id"]:
         raise ValueError("Coordinator and Worker session IDs differ")
     if front["tcp"]["sent_bytes"] != back["tcp"]["received_bytes"] or (
@@ -98,6 +104,9 @@ def render(results):
     print("Role | Prefill ms | Additional decode ms | Generation ms | Stage wall ms | TCP sent / received | Reader calls | Requested bytes | I/O wait ms")
     print("---|---:|---:|---:|---:|---:|---:|---:|---:")
     for run, joined in results:
+        print()
+        print(f'Stage TCP v{run[1].get("protocol_version", 1)} '
+              f'{run[1].get("logits_response", "full")}')
         for item in run:
             gen = item.get("generation", {})
             phase = lambda key: f"{gen[key]:.3f}" if key in gen else "-"
@@ -149,7 +158,11 @@ def main():
     try:
         results = [compare(triple) for triple in zip(args.baseline, args.coordinator, args.worker)]
         reference = results[0][0][0]
+        first_coordinator = results[0][0][1]
         for values, _ in results[1:]:
+            if (values[1].get("logits_response", "full"), "tcp_detail" in values[1]) != (
+                    first_coordinator.get("logits_response", "full"), "tcp_detail" in first_coordinator):
+                raise ValueError("repetition differs: response mode or TCP diagnostic setting")
             for key in ("prompt_token_sha256", "model_identity", "revision", "context", "batch", "threads",
                         "pager_budget_mib", "pager_policy", "expert_prefetch_depth", "io", "max_new_tokens", "cache_state_label"):
                 if values[0][key] != reference[key]:

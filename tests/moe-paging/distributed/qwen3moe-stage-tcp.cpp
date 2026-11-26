@@ -37,11 +37,13 @@ extern "C" {
 using bytes = std::vector<uint8_t>;
 using steady_clock = stage_tcp::clock;
 constexpr uint32_t magic = 0x53454f4d;
-constexpr uint32_t version = 1;
+constexpr uint32_t full_version = 1;
+constexpr uint32_t compact_version = 2;
+constexpr uint32_t compact_capability = 1;
 constexpr uint32_t cap = 16 * 1024 * 1024;
 constexpr uint32_t wire_f32 = 1;
 constexpr uint32_t wire_qwen3moe = 1;
-enum message : uint32_t { hello = 1, open_session, execute_stage, stage_result, close_session, error_message, ack };
+enum message : uint32_t { hello = 1, open_session, execute_stage, stage_result, close_session, error_message, ack, status_only, greedy_token };
 enum class state { created, ready, active, closed, failed };
 
 static void require(bool ok, const char * why) {
@@ -90,6 +92,7 @@ struct frame {
 
 struct channel {
     stage_tcp::socket peer;
+    uint32_t version = full_version;
     uint64_t sent = 0, received = 0;
     std::chrono::milliseconds frame_limit;
     stage_performance * perf;
@@ -141,7 +144,7 @@ struct channel {
                 packet.kind, packet.request, packet.body.size());
     }
 
-    frame receive(uint32_t response_ms = 0) {
+    frame receive(uint32_t response_ms = 0, bool accept_version = false) {
         if (perf && perf->detail_enabled) last_receive = {};
         bytes header(24);
         const size_t starting_bytes = response_ms ? 1 : 0;
@@ -158,11 +161,18 @@ struct channel {
                  &stage_performance::transfer_detail::header_ms);
         reader r{header};
         require(r.word() == magic, "bad protocol magic");
-        require(r.word() == version, "unsupported protocol version");
+        const auto incoming_version = r.word();
+        require(accept_version ? (incoming_version == full_version || incoming_version == compact_version)
+                               : incoming_version == version, "unsupported protocol version");
+        if (accept_version) version = incoming_version;
         const uint32_t type = r.word();
         const uint32_t length = r.word();
-        require(type >= hello && type <= ack, "unexpected message type");
+        require(type >= hello && type <= (version == compact_version ? greedy_token : ack), "unexpected message type");
         require(length <= cap, "invalid frame length");
+        if (version == compact_version) {
+            require(type != stage_result && (type != status_only || length == 12) &&
+                    (type != greedy_token || length == 16), "invalid compact frame type or length");
+        }
         frame packet{type, r.word(), r.word(), bytes(length)};
         transfer(packet.body.data(), packet.body.size(), false, deadline, &stage_performance::transfer_detail::payload_ms);
         std::fprintf(stderr, "rx type=%u request=%u header=24 payload=%zu\n",
@@ -191,7 +201,7 @@ struct options {
     uint32_t connect_ms = 10000, accept_ms = 10000, frame_ms = 10000, response_ms = 10000;
     bool auto_identity = false;
     std::vector<llama_token> tokens{1, 19, 7, 42, 51};
-    bool generate = false, fixed_input_set = false;
+    bool generate = false, fixed_input_set = false, worker_greedy = false;
     uint32_t max_new_tokens = 0;
     std::string prompt_file{}, system_file{}, rendered_prompt_file{};
     bool chat = false;
@@ -319,6 +329,12 @@ static void parse_options(options & cfg, int argc, char ** argv) {
             cfg.perf_cache_state = value;
             continue;
         }
+        if (key == "--logits-response") {
+            require(value == "full" || value == "worker-greedy", "invalid logits response mode");
+            cfg.worker_greedy = value == "worker-greedy";
+            require(!cfg.worker_greedy || cfg.role == "coordinator", "worker-greedy requires Coordinator");
+            continue;
+        }
         if (key == "--sampling") {
             require(value == "greedy", "only greedy sampling is supported");
             continue;
@@ -360,6 +376,7 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         else if (key == "--response-timeout-ms") cfg.response_ms = n;
         else throw std::runtime_error("unknown option " + key);
     }
+    require(!cfg.worker_greedy || cfg.generate, "worker-greedy requires --generate");
 }
 
 struct artifacts {
@@ -624,14 +641,39 @@ static void acknowledge(channel & wire, message type, uint32_t session, uint32_t
     require(packet.body.empty(), "unexpected acknowledgement payload");
 }
 
+static llama_token greedy(const float * logits, size_t width) {
+    require(logits && width && width <= INT32_MAX, "missing or invalid generation logits");
+    llama_token best = 0;
+    for (size_t i = 0; i < width; ++i) {
+        require(std::isfinite(logits[i]), "non-finite generation logits");
+        if (logits[i] > logits[best]) best = llama_token(i);
+    }
+    return best;
+}
+
+static void response_mode(stage_performance * perf, uint32_t version) {
+    const char * mode = version == compact_version ? "worker-greedy" : version ? "full" : "local";
+    std::fprintf(stderr, "logits_response=%s protocol_version=%u\n", mode, version);
+    if (perf) {
+        perf->summary["protocol_version"] = version;
+        perf->summary["logits_response"] = mode;
+        perf->summary["compact_capability"] = version == compact_version;
+    }
+}
+
 static void worker(const options & cfg, stage & local, channel & wire, state & status, uint32_t & session, uint32_t & request) {
     auto * perf = local.perf;
     const auto handshake = perf ? steady_clock::now() : steady_clock::time_point{};
-    auto announcement = wire.receive();
+    auto announcement = wire.receive(0, true);
     expect(announcement, hello, 0, 0);
-    require(announcement.body == local.metadata(cfg), "model or stage metadata mismatch");
+    auto metadata = local.metadata(cfg);
+    const bool compact = wire.version == compact_version;
+    if (compact) put(metadata, compact_capability);
+    require(announcement.body == metadata, compact ? "model or stage metadata mismatch (including v2 capability)"
+                                                   : "model or stage metadata mismatch");
     wire.send({hello, 0, 0, announcement.body});
     acknowledge(wire, open_session, 0, 0);
+    response_mode(perf, wire.version);
     session = std::random_device{}();
     if (!session) session = 1;
     status = state::active;
@@ -640,6 +682,8 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         perf->session = session;
         perf->summary["handshake_wall_ms"] = stage_performance::elapsed(handshake);
     }
+    uint64_t checked_rows = 0, status_responses = 0, greedy_responses = 0;
+    double validation_ms = 0, greedy_ms = 0;
     uint32_t position = 0;
     for (request = 1; ; ++request) {
         const auto receive_before = perf ? perf->receive_ms : 0;
@@ -650,6 +694,13 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
             require(packet.body.empty(), "invalid CLOSE");
             wire.send({ack, session, request, {}});
             status = state::closed;
+            if (perf && compact) {
+                perf->summary["compact_responses"] = {{"status_only", status_responses}, {"greedy_token", greedy_responses},
+                    {"computed_logits_rows", checked_rows}, {"validated_logits_rows", checked_rows},
+                    {"transmitted_logits_rows", 0}, {"transmitted_token_ids", greedy_responses},
+                    {"omitted_logits_bytes", checked_rows * local.vocab * sizeof(float)},
+                    {"validation_only_ms", validation_ms}, {"greedy_and_validation_ms", greedy_ms}};
+            }
             return;
         }
         expect(packet, execute_stage, session, request);
@@ -661,6 +712,8 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
                 "invalid token count");
         require(r.word() == local.hidden, "invalid hidden size");
         require(r.word() == 0 && r.word() == wire_f32, "invalid sequence or activation type");
+        const uint32_t response_kind = compact ? r.word() : stage_result;
+        require(!compact || response_kind == status_only || response_kind == greedy_token, "invalid requested response kind");
         std::vector<llama_pos> positions(count);
         for (uint32_t i = 0; i < count; ++i) {
             const auto value = r.word();
@@ -690,11 +743,38 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         put(result, 0);
         put(result, count);
         put(result, local.vocab);
-        local.logits(result, count);
+        if (compact) {
+            const auto validation_start = sample ? steady_clock::now() : steady_clock::time_point{};
+            llama_token selected = -1;
+            for (uint32_t row = 0; row < count; ++row) {
+                const auto * values = llama_get_logits_ith(local.context.get(), row);
+                require(values && local.vocab, "missing logits");
+                if (response_kind == greedy_token && row + 1 == count) {
+                    const auto greedy_start = sample ? steady_clock::now() : steady_clock::time_point{};
+                    if (sample) validation_ms += stage_performance::elapsed(validation_start);
+                    selected = greedy(values, local.vocab);
+                    if (sample) greedy_ms += stage_performance::elapsed(greedy_start);
+                } else {
+                    for (uint32_t col = 0; col < local.vocab; ++col) {
+                        require(std::isfinite(values[col]), "non-finite logits");
+                    }
+                }
+            }
+            if (response_kind == greedy_token) {
+                put(result, uint32_t(selected));
+                ++greedy_responses;
+            } else {
+                if (sample) validation_ms += stage_performance::elapsed(validation_start);
+                ++status_responses;
+            }
+            checked_rows += count;
+        } else {
+            local.logits(result, count);
+        }
         if (sample) sample->serialize = stage_performance::elapsed(encode_start);
         const auto send_before = perf ? perf->send_ms : 0;
         const auto sent_before = wire.sent;
-        wire.send({stage_result, session, request, std::move(result)});
+        wire.send({response_kind, session, request, std::move(result)});
         if (sample) {
             sample->send = perf->send_ms - send_before;
             sample->sent = wire.sent - sent_before;
@@ -823,16 +903,6 @@ static std::vector<llama_token> generation_prompt(const options & cfg, const lla
     return tokens;
 }
 
-static llama_token greedy(const std::vector<float> & logits) {
-    require(!logits.empty(), "missing generation logits");
-    llama_token best = 0;
-    for (size_t i = 0; i < logits.size(); ++i) {
-        require(std::isfinite(logits[i]), "non-finite generation logits");
-        if (logits[i] > logits[best]) best = llama_token(i);
-    }
-    return best;
-}
-
 static std::string generation_text(const llama_vocab * vocab, const std::vector<llama_token> & tokens) {
     if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE || tokens.empty()) return {};
     const int capacity = llama_detokenize(vocab, tokens.data(), tokens.size(), nullptr, 0, true, false);
@@ -851,11 +921,16 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
     auto * perf = local.perf;
     const auto handshake = perf ? steady_clock::now() : steady_clock::time_point{};
     if (wire) {
-        const auto metadata = local.metadata(cfg);
+        auto metadata = local.metadata(cfg);
+        if (cfg.worker_greedy) {
+            wire->version = compact_version;
+            put(metadata, compact_capability);
+        }
         wire->send({hello, 0, 0, metadata});
         const auto response = wire->receive();
         expect(response, hello, 0, 0);
-        require(response.body == metadata, "worker metadata mismatch");
+        require(response.body == metadata, cfg.worker_greedy ? "worker metadata mismatch (including v2 capability)"
+                                                             : "worker metadata mismatch");
         wire->send({open_session, 0, 0, {}});
         const auto ready = wire->receive();
         require(ready.session != 0 && ready.body.empty(), "invalid session acknowledgement");
@@ -867,6 +942,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         }
     }
     status = state::active;
+    response_mode(perf, wire ? wire->version : 0);
     const auto * vocab = llama_model_get_vocab(local.model.get());
     const auto prepare_start = perf ? steady_clock::now() : steady_clock::time_point{};
     auto tokens = cfg.generate ? generation_prompt(cfg, local.model.get(), vocab) : cfg.tokens;
@@ -888,7 +964,8 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
     request = 1;
     double extra_decode_wall_ms = 0;
     uint32_t decode_steps = 0;
-    auto evaluate = [&](llama_token * input, uint32_t offset, uint32_t count, const char * phase) {
+    llama_token selected_token = -1;
+    auto evaluate = [&](llama_token * input, uint32_t offset, uint32_t count, const char * phase, bool select_token) {
         const auto evaluation_start = perf ? steady_clock::now() : steady_clock::time_point{};
         stage_performance::row * sample = nullptr;
         if (perf) {
@@ -915,6 +992,8 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
             const auto encode_start = sample ? steady_clock::now() : steady_clock::time_point{};
             bytes activation;
             for (auto field : {count, local.hidden, 0u, wire_f32}) put(activation, field);
+            const message response_kind = cfg.worker_greedy ? (select_token ? greedy_token : status_only) : stage_result;
+            if (cfg.worker_greedy) put(activation, response_kind);
             for (auto position : positions) put(activation, position);
             const auto * values = llama_get_embeddings(local.context.get());
             require(values, "missing stage boundary");
@@ -940,11 +1019,21 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
                 sample->received = wire->received - received_before;
             }
             const auto parse_start = sample ? steady_clock::now() : steady_clock::time_point{};
-            expect(result, stage_result, session, request);
+            expect(result, response_kind, session, request);
             reader r{result.body};
             require(r.word() == 0 && r.word() == count && r.word() == local.vocab, "invalid output shape or status");
-            const auto remote_logits = floats(r, count, local.vocab);
-            if (cfg.generate) {
+            if (cfg.worker_greedy) {
+                if (select_token) {
+                    const auto id = r.word();
+                    require(id < local.vocab && id <= INT32_MAX, "invalid greedy token ID");
+                    selected_token = llama_token(id);
+                }
+                r.done();
+                if (perf && perf->detail_enabled) {
+                    perf->add_communication({request, wire->last_send, wire->last_receive, -1, 0});
+                }
+            } else if (cfg.generate) {
+                const auto remote_logits = floats(r, count, local.vocab);
                 const auto copy_start = perf && perf->detail_enabled ? steady_clock::now() : steady_clock::time_point{};
                 last.assign(remote_logits.end() - local.vocab, remote_logits.end());
                 if (perf && perf->detail_enabled) {
@@ -953,6 +1042,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
                 }
             } else {
                 const auto copy_start = perf && perf->detail_enabled ? steady_clock::now() : steady_clock::time_point{};
+                floats(r, count, local.vocab);
                 local.output.logits.insert(local.output.logits.end(), result.body.begin() + 12, result.body.end());
                 if (perf && perf->detail_enabled) {
                     perf->add_communication({request, wire->last_send, wire->last_receive,
@@ -972,7 +1062,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
     for (uint32_t offset = 0; offset < tokens.size();) {
         const uint32_t count = cfg.generate ? std::min<uint32_t>(cfg.batch, tokens.size() - offset) :
             (offset == 0 ? cfg.prefill : 1);
-        last = evaluate(tokens.data() + offset, offset, count, cfg.generate ? "prefill" : "fixed");
+        last = evaluate(tokens.data() + offset, offset, count, cfg.generate ? "prefill" : "fixed", offset + count == tokens.size());
         offset += count;
         ++prefill_batches;
     }
@@ -985,8 +1075,8 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
         double selection_ms = 0, first_selection_ms = 0, stop_check_ms = 0;
         for (uint32_t step = 0; step < cfg.max_new_tokens; ++step) {
             const auto selection_start = perf ? steady_clock::now() : steady_clock::time_point{};
-            auto token = greedy(last);
-            if (perf) {
+            auto token = cfg.worker_greedy ? selected_token : greedy(last.data(), last.size());
+            if (perf && !cfg.worker_greedy) {
                 const double duration = stage_performance::elapsed(selection_start);
                 selection_ms += duration;
                 if (step == 0) first_selection_ms = duration;
@@ -1002,7 +1092,7 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
                 reason = stop;
                 break;
             }
-            last = evaluate(&token, next_position++, 1, "decode");
+            last = evaluate(&token, next_position++, 1, "decode", true);
             ++decode_steps;
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(steady_clock::now() - decode_start).count();
@@ -1135,6 +1225,8 @@ int main(int argc, char ** argv) {
                 llama_version(), STAGE_BUILD_COMMIT, cfg.identity.empty() ? "-" : cfg.identity.c_str(),
                 cfg.auto_identity ? "local-sha256" : cfg.identity.empty() ? "metadata" : "label",
                 hash_ms, cfg.role.c_str());
+        if (perf) perf->summary["requested_logits_response"] = cfg.role == "coordinator"
+                ? (cfg.worker_greedy ? "worker-greedy" : "full") : "none";
         stage local(cfg, perf.get());
         state status = state::created;
         uint32_t session = 0, request = 0;

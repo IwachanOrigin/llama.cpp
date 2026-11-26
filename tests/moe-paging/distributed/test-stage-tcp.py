@@ -4,6 +4,7 @@ import hashlib
 import csv
 import json
 import runpy
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import queue
@@ -140,9 +141,9 @@ def receive(peer, count):
     return bytes(data)
 
 
-def read_frame(peer):
+def read_frame(peer, expected_version=1):
     magic, version, kind, size, sid, rid = HEADER.unpack(receive(peer, HEADER.size))
-    verify(magic == MAGIC and version == 1 and size <= (16 << 20), "bad response framing")
+    verify(magic == MAGIC and version == expected_version and size <= (16 << 20), "bad response framing")
     return kind, sid, rid, receive(peer, size)
 
 
@@ -271,6 +272,24 @@ def generation(exe, model, root, label):
            summaries[0]["stage"]["stage_execution_min_ms"] <= summaries[0]["stage"]["stage_execution_avg_ms"] <=
            summaries[0]["stage"]["stage_execution_max_ms"], "profile aggregate is inconsistent")
     verify(phases["decode"]["worker_reads"] > 0, "worker Pager counters were not recorded")
+    compact_front = root / "compact-front"
+    compact_worker = root / "compact-worker"
+    with start_worker(exe, model, "mmap", compact_worker, label,
+                      extra=worker_options + ["--tcp-perf-details"]) as (child, port, worker_log):
+        compact_log = run(command(exe, "coordinator", model, port, "mmap", compact_front, label) +
+                          options + ["--tcp-perf-details", "--logits-response", "worker-greedy"],
+                          root / "compact-front.log")
+        verify(child.wait(timeout=15) == 0, "compact Worker failed")
+        verify(re.findall(r"tx type=([89]) request=\d+", worker_log.read_text(errors="replace")) ==
+               ["8", "9", "9", "9", "9"], "compact reply sequence differs")
+    verify(compact_front.with_suffix(".generated_tokens").read_bytes() == a and "stop=limit" in compact_log,
+           "compact generation differs")
+    compact_summaries, _ = analyze["compare"]([prefix.with_suffix(".metrics.json") for prefix in (
+        profiled, compact_front, compact_worker)])
+    counters = compact_summaries[2]["compact_responses"]
+    verify(counters["validated_logits_rows"] == 6 and counters["transmitted_logits_rows"] == 0 and
+           counters["status_only"] == 1 and counters["transmitted_token_ids"] == 4,
+           "compact row accounting differs")
     traced = root / "trace-baseline"
     run(command(exe, "baseline", model, 0, "mmap", traced, label) + options +
         ["--expert-io-trace-limit", "10000", "--perf-details"], root / "trace-baseline.log")
@@ -416,6 +435,114 @@ def generation(exe, model, root, label):
     print("greedy maximum, lowest-ID tie and non-finite logits verified")
 
 
+def compact_prefill(exe, model, root, label):
+    for index, (prompt, batch, max_new, reason, kinds) in enumerate((
+            ("1", "1", "1", "limit", ["9"]),
+            ("1", "2", "1", "limit", ["9"]),
+            ("1,19", "2", "1", "limit", ["9"]),
+            ("1,19,7,42", "2", "4", "context", ["8", "9"]),
+            ("1,19,7,42", "3", "4", "context", ["8", "9"]),
+            ("1,19,7,42", "1", "4", "context", ["8", "8", "8", "9"]))):
+        flags = ["--ctx", "4", "--batch", batch, "--threads", "1"]
+        generate = ["--generate", "--prompt-tokens", prompt, "--max-new-tokens", max_new]
+        baseline, front, worker = (root / f"compact-prefill-{index}-{role}" for role in ("base", "front", "worker"))
+        run(command(exe, "baseline", model, 0, "mmap", baseline, label) + flags + generate,
+            baseline.with_suffix(".log"))
+        with start_worker(exe, model, "mmap", worker, label, extra=flags) as (child, port, worker_log):
+            log = run(command(exe, "coordinator", model, port, "mmap", front, label) + flags + generate +
+                      ["--logits-response", "worker-greedy"], front.with_suffix(".log"))
+            verify(child.wait(timeout=15) == 0 and "stop=" + reason in log, "unexpected compact stop")
+            verify(re.findall(r"tx type=([89]) request=\d+", worker_log.read_text(errors="replace")) == kinds,
+                   "incorrect compact batch boundary or extra Decode")
+        verify(front.with_suffix(".generated_tokens").read_bytes() == baseline.with_suffix(".generated_tokens").read_bytes(),
+               "compact Prefill selected a different token")
+
+
+def compact_nonfinite(exe, model, root):
+    # The fixture ties token_embd.weight to the output projection. Poison
+    # token 0's projection while choosing prompt tokens other than zero.
+    poisoned = root / "nonfinite.gguf"
+    shutil.copyfile(model, poisoned)
+    with poisoned.open("r+b") as stream:
+        header = stream.read(16384)
+        name = b"blk.1.ffn_down_exps.weight"
+        last_tensor_name = header.index(name)
+        end_of_header = last_tensor_name + len(name) + struct.calcsize("<I3QIQ")
+        data_offset = (end_of_header + 31) & ~31
+        stream.seek(data_offset)
+        stream.write(struct.pack("<f", float("nan")))
+    label = identity(poisoned)
+    for prompt in ("1,19", "1,19,7"):
+        output = root / ("nonfinite-" + str(len(prompt)))
+        with start_worker(exe, poisoned, "mmap", root / (output.name + "-worker"), label) as (worker, port, worker_log):
+            front = run(command(exe, "coordinator", poisoned, port, "mmap", output, label) +
+                        ["--generate", "--prompt-tokens", prompt, "--max-new-tokens", "1",
+                         "--logits-response", "worker-greedy"], output.with_suffix(".log"), expected=1)
+            verify(worker.wait(timeout=15) == 1 and "peer ERROR: non-finite" in front and
+                   "tx type=8" not in worker_log.read_text(errors="replace") and
+                   not output.with_suffix(".generated_tokens").exists(),
+                   "non-finite compact output was accepted")
+
+
+def compact_failures(exe, model, root, label):
+    for role, flags, reason in (
+            ("coordinator", ["--logits-response", "unknown"], "invalid logits response mode"),
+            ("coordinator", ["--logits-response", "worker-greedy"], "worker-greedy requires --generate"),
+            ("baseline", ["--logits-response", "worker-greedy"], "worker-greedy requires Coordinator"),
+            ("coordinator", ["--logits-response", "worker-greedy", "--generate",
+                             "--sampling", "top-k"], "only greedy sampling is supported")):
+        output = root / "compact-invalid-cli"
+        log = run(command(exe, role, model, 0, "mmap", output, label) + flags,
+                  output.with_suffix(".log"), expected=1)
+        verify(reason in log, "invalid response CLI was accepted")
+    for scenario in ("legacy-version", "capability", "wrong-kind", "extra-data", "negative-id",
+                     "large-id", "status", "count", "session", "request"):
+        with socket.socket() as listener, ThreadPoolExecutor(max_workers=1) as pool:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(8)
+
+            def scripted_worker():
+                peer, _ = listener.accept()
+                with peer:
+                    peer.settimeout(8)
+                    kind, sid, rid, hello = read_frame(peer, 2)
+                    verify((kind, sid, rid) == (1, 0, 0) and hello[-4:] == struct.pack("<I", 1),
+                           "missing v2 capability")
+                    if scenario == "legacy-version":
+                        peer.sendall(frame(6, body=b"unsupported protocol version"))
+                    elif scenario == "capability":
+                        peer.sendall(frame(1, body=hello[:-4] + struct.pack("<I", 2), version=2))
+                    else:
+                        peer.sendall(frame(1, body=hello, version=2))
+                        verify(read_frame(peer, 2)[0] == 2, "missing OPEN")
+                        peer.sendall(frame(7, sid=1, version=2))
+                        kind, sid, rid, execute = read_frame(peer, 2)
+                        verify((kind, sid, rid) == (3, 1, 1) and struct.unpack_from("<I", execute, 16)[0] == 9,
+                               "unexpected final-Prefill request")
+                        body = struct.pack("<4I", 1 if scenario == "status" else 0,
+                                           2 if scenario == "count" else 1, 128,
+                                           {"negative-id": 0xffffffff, "large-id": 128}.get(scenario, 7))
+                        if scenario == "wrong-kind":
+                            body = body[:12]
+                        if scenario == "extra-data":
+                            body += bytes(4)
+                        peer.sendall(frame(8 if scenario == "wrong-kind" else 9,
+                                           2 if scenario == "session" else 1,
+                                           2 if scenario == "request" else 1, body, version=2))
+                    verify(read_frame(peer, 2)[0] == 6, "failed session continued")
+
+            future = pool.submit(scripted_worker)
+            output = root / ("compact-" + scenario)
+            log = run(command(exe, "coordinator", model, listener.getsockname()[1], "mmap", output, label) +
+                      ["--generate", "--prompt-tokens", "1", "--max-new-tokens", "1",
+                       "--logits-response", "worker-greedy"], output.with_suffix(".log"), expected=1)
+            future.result(timeout=10)
+            verify(not output.with_suffix(".generated_tokens").exists(), "failure published generation")
+            if scenario in ("legacy-version", "capability"):
+                verify("compute position=" not in log, "incompatible connection started inference")
+
+
 def main(exe, single, split, logs=None):
     def test(root):
         for index, model in enumerate(map(Path, (single, split))):
@@ -443,6 +570,9 @@ def main(exe, single, split, logs=None):
                 path = root / "generation"
                 path.mkdir()
                 generation(exe, model, path, label)
+                compact_failures(exe, model, path, label)
+                compact_nonfinite(exe, model, path)
+                compact_prefill(exe, model, path, label)
     if logs is not None:
         root = Path(logs)
         root.mkdir()

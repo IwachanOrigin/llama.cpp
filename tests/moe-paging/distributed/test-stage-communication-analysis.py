@@ -35,6 +35,21 @@ class Communication(unittest.TestCase):
         self.assertEqual(options["worker_greedy_or_empty"]["logits_or_token_bytes"], 8)
         self.assertEqual(options["full"]["coordinator_bytes"], options["last_or_empty"]["coordinator_bytes"])
 
+    def test_compact_schedule(self):
+        front, worker = fixture()
+        for index, (local, remote) in enumerate(zip(front, worker)):
+            request_bytes = int(local["send_bytes"]) + 4
+            result_bytes = 36 if index == 0 else 40
+            local["send_bytes"] = remote["receive_bytes"] = str(request_bytes)
+            local["receive_bytes"] = remote["send_bytes"] = str(result_bytes)
+        joined = TOOLS["join"](front, worker, 2, 4, 4, 2, True)
+        self.assertEqual([r["response_kind"] for r in joined], [8, 9, 9])
+        self.assertEqual(sum(r["token_id_bytes"] for r in joined), 8)
+        self.assertEqual(sum(r["transmitted_logits_bytes"] for r in joined), 0)
+        front[0]["receive_bytes"] = worker[0]["send_bytes"] = "40"
+        with self.assertRaises(ValueError):
+            TOOLS["join"](front, worker, 2, 4, 4, 2, True)
+
     def test_rejects_inconsistent_runs(self):
         for side, index, key, value in ((1, 0, "request_id", "2"), (0, 1, "request_id", "1"),
                                        (1, 0, "position", "1"), (1, 0, "phase", "decode"),

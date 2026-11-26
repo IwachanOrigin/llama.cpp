@@ -17,7 +17,7 @@ FRAME = struct.Struct("<6I")
 MAGIC = 0x53454F4D
 LIMIT = 16 << 20
 REQUESTS = (0, 4, 64, 1024, 8192, 16384)
-RESPONSES = (0, 4, 64, 1024, 8192, 607744, 1215488)
+RESPONSES = (0, 4, 12, 16, 64, 1024, 8192, 607744, 1215488)
 
 
 def exact(peer, size):
