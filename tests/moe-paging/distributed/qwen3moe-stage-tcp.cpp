@@ -17,6 +17,8 @@ extern "C" {
 #include <psapi.h>
 #endif
 
+#include <array>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
@@ -97,8 +99,17 @@ struct channel {
     std::chrono::milliseconds frame_limit;
     stage_performance * perf;
     stage_performance::transfer_detail last_send{}, last_receive{};
-    explicit channel(stage_tcp::socket socket, uint32_t frame_ms, stage_performance * details)
-        : peer(std::move(socket)), frame_limit(frame_ms), perf(details) {}
+    static constexpr size_t coalesce_limit = 256;
+    bool coalesce, log_frames;
+    explicit channel(stage_tcp::socket socket, uint32_t frame_ms, stage_performance * details,
+                     bool nodelay = false, bool coalesce = false, bool log_frames = true)
+        : peer(std::move(socket)), frame_limit(frame_ms), perf(details), coalesce(coalesce), log_frames(log_frames) {
+        const bool effective = peer.nodelay(nodelay);
+        if (perf) perf->summary["transport"] = {{"nodelay_requested", nodelay}, {"nodelay_effective", effective},
+            {"small_frame_coalesce", coalesce}, {"coalesce_limit_bytes", coalesce_limit}};
+        if (log_frames) std::fprintf(stderr, "tcp_nodelay_requested=%d tcp_nodelay_effective=%d tcp_small_frame_coalesce=%d\n",
+                                     int(nodelay), int(effective), int(coalesce));
+    }
 
     void transfer(uint8_t * data, size_t size, bool sending, steady_clock::time_point deadline, double stage_performance::transfer_detail::* part) {
         auto & count = sending ? sent : received;
@@ -132,15 +143,30 @@ struct channel {
 
     void send(frame packet) {
         require(packet.body.size() <= cap, "outgoing frame too large");
-        bytes header;
+        std::array<uint8_t, coalesce_limit> storage;
+        constexpr size_t header_size = 24;
+        size_t offset = 0;
         for (auto value : {magic, version, packet.kind, uint32_t(packet.body.size()), packet.session, packet.request}) {
-            put(header, value);
+            for (unsigned shift = 0; shift < 32; shift += 8) storage[offset++] = uint8_t(value >> shift);
         }
         const auto deadline = steady_clock::now() + frame_limit;
-        if (perf && perf->detail_enabled) last_send = {};
-        transfer(header.data(), header.size(), true, deadline, &stage_performance::transfer_detail::header_ms);
-        transfer(packet.body.data(), packet.body.size(), true, deadline, &stage_performance::transfer_detail::payload_ms);
-        std::fprintf(stderr, "tx type=%u request=%u header=24 payload=%zu\n",
+        const bool detail = perf && perf->detail_enabled;
+        if (detail) last_send = {};
+        if (coalesce && !packet.body.empty() && packet.body.size() <= storage.size() - header_size) {
+            const auto start = detail ? steady_clock::now() : steady_clock::time_point{};
+            std::memcpy(storage.data() + header_size, packet.body.data(), packet.body.size());
+            const size_t combined_size = header_size + packet.body.size();
+            if (detail) {
+                last_send.combined_bytes = combined_size;
+                last_send.coalesce_copy_bytes = packet.body.size();
+                last_send.coalesce_copy_ms = stage_performance::elapsed(start);
+            }
+            transfer(storage.data(), combined_size, true, deadline, &stage_performance::transfer_detail::combined_ms);
+        } else {
+            transfer(storage.data(), header_size, true, deadline, &stage_performance::transfer_detail::header_ms);
+            transfer(packet.body.data(), packet.body.size(), true, deadline, &stage_performance::transfer_detail::payload_ms);
+        }
+        if (log_frames) std::fprintf(stderr, "tx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
     }
 
@@ -175,7 +201,7 @@ struct channel {
         }
         frame packet{type, r.word(), r.word(), bytes(length)};
         transfer(packet.body.data(), packet.body.size(), false, deadline, &stage_performance::transfer_detail::payload_ms);
-        std::fprintf(stderr, "rx type=%u request=%u header=24 payload=%zu\n",
+        if (log_frames) std::fprintf(stderr, "rx type=%u request=%u header=24 payload=%zu\n",
                 packet.kind, packet.request, packet.body.size());
         if (type == error_message) {
             throw std::runtime_error("peer ERROR: " + std::string(packet.body.begin(), packet.body.end()));
@@ -207,7 +233,7 @@ struct options {
     bool chat = false;
     bool perf_details = false;
     uint32_t expert_trace_limit = 0;
-    bool tcp_perf_details = false;
+    bool tcp_perf_details = false, tcp_nodelay = false, tcp_coalesce = false;
     uint32_t expert_io_trace_limit = 0;
     uint32_t expert_prefetch_depth = 0;
     std::string pager_policy = "lru";
@@ -327,6 +353,11 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         if (key == "--perf-cache-state") {
             require(value == "warm" || value == "cold" || value == "uncontrolled", "invalid cache-state label");
             cfg.perf_cache_state = value;
+            continue;
+        }
+        if (key == "--tcp-nodelay" || key == "--tcp-small-frame-coalesce") {
+            require(value == "0" || value == "1", "TCP transport option must be 0 or 1");
+            (key == "--tcp-nodelay" ? cfg.tcp_nodelay : cfg.tcp_coalesce) = value == "1";
             continue;
         }
         if (key == "--logits-response") {
@@ -1123,7 +1154,115 @@ static void coordinator(const options & cfg, stage & local, channel * wire, stat
     status = state::closed;
 }
 
+static int transport_benchmark(int argc, char ** argv) {
+    require(argc == 12, "transport-bench server|client PORT small|full|full2|mixed-full|mixed-greedy|boundary NODELAY COALESCE DELAY_MS WARMUP SAMPLES OUTPUT CONNECTION");
+    const std::string role = argv[2], pattern = argv[4];
+    require(role == "server" || role == "client", "invalid benchmark role");
+    const bool server = role == "server";
+    const auto port = uint16_t(number(argv[3], 65535));
+    require(server || port, "client requires a port");
+    const bool nodelay = number(argv[5], 1), coalesce = number(argv[6], 1);
+    const auto delay = number(argv[7], 5000), warmup = number(argv[8], 10000), samples = number(argv[9], 10000);
+    require(samples, "benchmark requires measured samples");
+    const bool mixed = pattern == "mixed-full" || pattern == "mixed-greedy";
+    const bool compact = pattern == "small" || pattern == "mixed-greedy";
+    const bool boundary = pattern == "boundary";
+    require(mixed || boundary || pattern == "small" || pattern == "full" || pattern == "full2", "invalid benchmark pattern");
+
+    stage_tcp::runtime sockets;
+    auto peer = [&] {
+        if (!server) return stage_tcp::connect(port, std::chrono::seconds(30));
+        stage_tcp::socket listener;
+        const auto bound = stage_tcp::listen(listener, port);
+        std::printf("READY %u\n", bound);
+        std::fflush(stdout);
+        return stage_tcp::accept(listener, std::chrono::seconds(60));
+    }();
+    stage_performance perf;
+    perf.detail_enabled = true;
+    channel wire(std::move(peer), 15000, &perf, nodelay, coalesce, false);
+    wire.version = compact ? compact_version : full_version;
+    auto rows = nlohmann::json::array();
+    std::vector<double> rtts;
+    std::array<uint32_t, 8> histogram{};
+    const std::array<double, 7> boundaries{1, 5, 10, 20, 40, 100, 200};
+    const uint32_t period = mixed ? 73 : boundary ? 4 : 1;
+    require(uint64_t(warmup + samples) * period <= 10000, "benchmark request limit exceeded");
+    const std::array<size_t, 4> boundary_sizes{0, 231, 232, 233};
+    const uint32_t end = (warmup + samples) * period;
+    uint64_t measured_sent = 0, measured_received = 0;
+    for (uint32_t request = 1; request <= end; ++request) {
+        const auto step = (request - 1) % period;
+        const bool two = pattern == "full2" || (mixed && step < 9);
+        const uint32_t count = two ? 2 : 1;
+        const uint32_t kind = compact ? (step < 9 && mixed ? status_only : greedy_token) : stage_result;
+        const size_t request_size = 16 + count * (4 + 8192) + 4 * compact;
+        const size_t reply_size = boundary ? boundary_sizes[step] :
+            12 + (compact ? (kind == greedy_token ? 4 : 0) : count * 607744);
+        bytes input(request_size, uint8_t(request)), output(reply_size, uint8_t(request + 1));
+        const auto before_sent = wire.sent, before_received = wire.received;
+        const auto start = steady_clock::now();
+        double wait_ms = 0;
+        if (server) {
+            const auto packet = wire.receive();
+            expect(packet, execute_stage, 1, request);
+            require(packet.body == input, "benchmark request bytes differ");
+            if (delay) {
+                const auto waiting = steady_clock::now();
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                wait_ms = stage_performance::elapsed(waiting);
+            }
+            wire.send({kind, 1, request, std::move(output)});
+        } else {
+            wire.send({execute_stage, 1, request, std::move(input)});
+            const auto packet = wire.receive(15000);
+            const auto rtt = stage_performance::elapsed(start);
+            require(packet.kind == kind && packet.session == 1 && packet.request == request && packet.body == output,
+                    "benchmark response differs");
+            if (request > warmup * period) {
+                rtts.push_back(rtt);
+                ++histogram[std::upper_bound(boundaries.begin(), boundaries.end(), rtt) - boundaries.begin()];
+            }
+        }
+        if (request > warmup * period) {
+            measured_sent += wire.sent - before_sent;
+            measured_received += wire.received - before_received;
+            rows.push_back({{"request", request}, {"response_kind", kind}, {"request_payload_bytes", request_size},
+                {"response_payload_bytes", reply_size}, {"wait_ms", server ? nlohmann::json(wait_ms) : nlohmann::json(nullptr)},
+                {"rtt_ms", server ? nlohmann::json(nullptr) : nlohmann::json(rtts.back())},
+                {"send", wire.last_send.encode()}, {"receive", wire.last_receive.encode()}});
+        }
+    }
+    nlohmann::json report = {{"schema_version", 1}, {"status", "ok"}, {"role", role}, {"pattern", pattern},
+        {"connection", argv[11]}, {"local_endpoint", wire.peer.endpoint(false)}, {"peer_endpoint", wire.peer.endpoint(true)},
+        {"transport", perf.summary["transport"]}, {"response_delay_ms", delay},
+        {"header_bytes", 24}, {"warmup", warmup}, {"samples", samples}, {"requests", rows.size()},
+        {"sent_bytes", measured_sent}, {"received_bytes", measured_received}, {"payload_match", true},
+        {"timeouts", perf.timeouts}, {"transport_errors", perf.transport_errors}, {"rows", std::move(rows)}};
+    if (!rtts.empty()) {
+        std::sort(rtts.begin(), rtts.end());
+        const auto quantile = [&](double q) { return rtts[size_t(std::ceil(q * rtts.size())) - 1]; };
+        double total = 0;
+        for (auto time : rtts) total += time;
+        report["rtt"] = {{"mean_ms", total / rtts.size()}, {"median_ms", quantile(.5)}, {"p95_ms", quantile(.95)},
+            {"p99_ms", quantile(.99)}, {"max_ms", rtts.back()}, {"histogram_upper_bounds_ms", boundaries},
+            {"histogram_counts", histogram}};
+    }
+    std::ofstream file(std::filesystem::u8path(argv[10]));
+    file << report.dump(2) << '\n';
+    require(bool(file), "could not save benchmark results");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "transport-bench") == 0) {
+        try { return transport_benchmark(argc, argv); }
+        catch (const std::exception & error) {
+            std::fprintf(stderr, "transport benchmark failed: %s\n", error.what());
+            return 1;
+        }
+    }
+
     std::unique_ptr<stage_performance> perf;
     try {
         require(argc >= 8,
@@ -1256,7 +1395,7 @@ int main(int argc, char ** argv) {
             }();
             if (perf) perf->summary[cfg.role == "worker" ? "accept_wall_ms" : "connect_wall_ms"] =
                     stage_performance::elapsed(connect_start);
-            channel wire(std::move(peer), cfg.frame_ms, perf.get());
+            channel wire(std::move(peer), cfg.frame_ms, perf.get(), cfg.tcp_nodelay, cfg.tcp_coalesce);
             status = state::ready;
             try {
                 if (cfg.role == "worker") worker(cfg, local, wire, status, session, request);

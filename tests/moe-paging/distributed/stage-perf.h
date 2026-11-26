@@ -24,9 +24,14 @@ struct stage_performance {
     };
     struct transfer_detail {
         double first_byte_ms = 0, header_ms = 0, payload_ms = 0;
-        uint64_t calls = 0, partial = 0, retries = 0;
+        double combined_ms = 0, coalesce_copy_ms = 0;
+        uint64_t calls = 0, partial = 0, retries = 0, combined_bytes = 0, coalesce_copy_bytes = 0;
         json encode() const {
-            return {{"first_byte_ms", first_byte_ms}, {"header_ms", header_ms}, {"payload_ms", payload_ms},
+            return {{"first_byte_ms", first_byte_ms}, {"header_ms", combined_bytes ? json(nullptr) : json(header_ms)},
+                    {"payload_ms", combined_bytes ? json(nullptr) : json(payload_ms)},
+                    {"combined_send_ms", combined_bytes ? json(combined_ms) : json(nullptr)},
+                    {"combined_send_bytes", combined_bytes}, {"coalesce_copy_ms", coalesce_copy_ms},
+                    {"coalesce_copy_bytes", coalesce_copy_bytes},
                     {"calls", calls}, {"partial", partial}, {"retries", retries}};
         }
     };

@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace stage_tcp {
@@ -66,6 +68,41 @@ struct socket {
     socket & operator=(const socket &) = delete;
     socket(socket && other) noexcept : fd(std::exchange(other.fd, invalid)) {}
     ~socket() { if (fd != invalid) close(fd); }
+
+    std::string endpoint(bool remote) const {
+        sockaddr_in addr{};
+#ifdef _WIN32
+        int size = sizeof(addr);
+#else
+        socklen_t size = sizeof(addr);
+#endif
+        auto * name = reinterpret_cast<sockaddr *>(&addr);
+        const int result = remote ? getpeername(fd, name, &size) : getsockname(fd, name, &size);
+        char text[INET_ADDRSTRLEN];
+        if (result || !inet_ntop(AF_INET, &addr.sin_addr, text, sizeof(text))) {
+            throw std::runtime_error("cannot query TCP endpoint: " + std::to_string(error()));
+        }
+        return std::string(text) + ":" + std::to_string(ntohs(addr.sin_port));
+    }
+
+    bool nodelay(bool requested) const {
+        int value = 1;
+#ifdef _WIN32
+        int size = sizeof(value);
+        auto * option = reinterpret_cast<char *>(&value);
+#else
+        socklen_t size = sizeof(value);
+        auto * option = &value;
+#endif
+        if (requested && setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, option, size) != 0) {
+            throw std::runtime_error("TCP_NODELAY setsockopt failed: " + std::to_string(error()));
+        }
+        if (getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, option, &size) != 0) {
+            throw std::runtime_error("TCP_NODELAY getsockopt failed: " + std::to_string(error()));
+        }
+        if (requested && !value) throw std::runtime_error("TCP_NODELAY was not enabled");
+        return value != 0;
+    }
 
     void wait(bool writing, clock::time_point deadline) const {
         for (;;) {

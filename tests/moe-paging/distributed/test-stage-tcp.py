@@ -275,7 +275,8 @@ def generation(exe, model, root, label):
     compact_front = root / "compact-front"
     compact_worker = root / "compact-worker"
     with start_worker(exe, model, "mmap", compact_worker, label,
-                      extra=worker_options + ["--tcp-perf-details"]) as (child, port, worker_log):
+                      extra=worker_options + ["--tcp-perf-details", "--tcp-nodelay", "1",
+                                              "--tcp-small-frame-coalesce", "1"]) as (child, port, worker_log):
         compact_log = run(command(exe, "coordinator", model, port, "mmap", compact_front, label) +
                           options + ["--tcp-perf-details", "--logits-response", "worker-greedy"],
                           root / "compact-front.log")
@@ -286,6 +287,14 @@ def generation(exe, model, root, label):
            "compact generation differs")
     compact_summaries, _ = analyze["compare"]([prefix.with_suffix(".metrics.json") for prefix in (
         profiled, compact_front, compact_worker)])
+    front_transport, worker_transport = (data["transport"] for data in compact_summaries[1:])
+    verify(not front_transport["nodelay_requested"] and not front_transport["small_frame_coalesce"] and
+           worker_transport["nodelay_effective"] and worker_transport["small_frame_coalesce"],
+           "asymmetric transport settings were not applied")
+    sends = [item["send"] for item in compact_summaries[2]["tcp_detail"]["requests"]]
+    verify([item["combined_send_bytes"] for item in sends] == [36, 40, 40, 40, 40] and
+           all(item["header_ms"] is None and item["payload_ms"] is None and item["calls"] >= 1 for item in sends),
+           "compact frame metrics are inconsistent")
     counters = compact_summaries[2]["compact_responses"]
     verify(counters["validated_logits_rows"] == 6 and counters["transmitted_logits_rows"] == 0 and
            counters["status_only"] == 1 and counters["transmitted_token_ids"] == 4,
@@ -486,6 +495,8 @@ def compact_nonfinite(exe, model, root):
 
 def compact_failures(exe, model, root, label):
     for role, flags, reason in (
+            ("coordinator", ["--tcp-nodelay", "2"], "TCP transport option must be 0 or 1"),
+            ("worker", ["--tcp-small-frame-coalesce", "yes"], "TCP transport option must be 0 or 1"),
             ("coordinator", ["--logits-response", "unknown"], "invalid logits response mode"),
             ("coordinator", ["--logits-response", "worker-greedy"], "worker-greedy requires --generate"),
             ("baseline", ["--logits-response", "worker-greedy"], "worker-greedy requires Coordinator"),
@@ -543,8 +554,43 @@ def compact_failures(exe, model, root, label):
                 verify("compute position=" not in log, "incompatible connection started inference")
 
 
+def transport_boundary(exe, root):
+    outputs = []
+    for enabled in ("0", "1"):
+        result = root / ("transport-boundary-" + enabled + ".json")
+        with subprocess.Popen([exe, "transport-bench", "server", "0", "boundary", enabled, enabled,
+                               "0", "0", "1", str(result), "loopback"], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as child:
+            try:
+                ready = queue.Queue()
+                Thread(target=lambda: ready.put(child.stdout.readline()), daemon=True).start()
+                _, port = ready.get(timeout=15).split()
+                observed = []
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=10) as peer:
+                    for request, size in enumerate((0, 231, 232, 233), 1):
+                        packet = frame(3, 1, request, bytes([request]) * 8212)
+                        peer.sendall(packet[:7])
+                        peer.sendall(packet[7:])
+                        received = receive(peer, 24 + size)
+                        verify(received == frame(4, 1, request, bytes([request + 1]) * size),
+                               "transport changed frame bytes")
+                        observed.append(received)
+                verify(child.wait(timeout=15) == 0, "boundary benchmark did not finish")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+        data = json.loads(result.read_text())
+        verify([row["send"]["combined_send_bytes"] for row in data["rows"]] ==
+               ([0, 255, 256, 0] if enabled == "1" else [0, 0, 0, 0]), "coalescing threshold differs")
+        verify(enabled == "0" or data["transport"]["nodelay_effective"], "TCP_NODELAY was not effective")
+        outputs.append(observed)
+    verify(outputs[0] == outputs[1], "wire bytes differ with coalescing")
+
+
 def main(exe, single, split, logs=None):
     def test(root):
+        transport_boundary(exe, root)
         for index, model in enumerate(map(Path, (single, split))):
             label = identity(model)
             for io in ("mmap", "buffered"):

@@ -130,6 +130,9 @@ def render(results):
             if candidates[name] > 0:
                 print(f"  Largest observed component: {name} ({candidates[name]:.3f} ms).")
         for item in run:
+            if item["role"] != "baseline":
+                print(item["role"], "transport", json.dumps(item.get("transport"), sort_keys=True),
+                      "" if "transport" in item else "legacy OS default and split send")
             print(item["role"], "memory", json.dumps(item["process_memory"], sort_keys=True),
                   "buffers", json.dumps(item["model_memory"], sort_keys=True))
             print(item["role"], "pager", json.dumps(item["pager"], sort_keys=True))
@@ -163,6 +166,8 @@ def main():
             if (values[1].get("logits_response", "full"), "tcp_detail" in values[1]) != (
                     first_coordinator.get("logits_response", "full"), "tcp_detail" in first_coordinator):
                 raise ValueError("repetition differs: response mode or TCP diagnostic setting")
+            if any(values[index].get("transport") != results[0][0][index].get("transport") for index in (1, 2)):
+                raise ValueError("repetition differs: per-role transport settings")
             for key in ("prompt_token_sha256", "model_identity", "revision", "context", "batch", "threads",
                         "pager_budget_mib", "pager_policy", "expert_prefetch_depth", "io", "max_new_tokens", "cache_state_label"):
                 if values[0][key] != reference[key]:

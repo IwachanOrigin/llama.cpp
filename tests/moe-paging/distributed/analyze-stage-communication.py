@@ -155,9 +155,19 @@ def analyze(folder, connection):
                 raise ValueError("TCP diagnostic request identity differs")
             for kind in ("send", "receive"):
                 values = event[kind]
-                if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values.values()):
+                if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values.values() if v is not None):
                     raise ValueError("invalid diagnostic timing or transfer counter")
-                if values["calls"] < 2 or values["partial"] + values["retries"] > values["calls"]:
+                combined = values.get("combined_send_bytes", 0)
+                if combined:
+                    wire_bytes = row["sent_bytes" if role == "coordinator" else "received_bytes"]
+                    if (kind != "send" or combined != wire_bytes or not HEADER < combined <= 256 or
+                            values.get("coalesce_copy_bytes") != combined - HEADER or
+                            values.get("combined_send_ms") is None or
+                            values["header_ms"] is not None or values["payload_ms"] is not None):
+                        raise ValueError("invalid combined send accounting")
+                elif values["header_ms"] is None or values["payload_ms"] is None:
+                    raise ValueError("missing split transfer timing")
+                if values["calls"] < (1 if values.get("combined_send_bytes") else 2) or values["partial"] + values["retries"] > values["calls"]:
                     raise ValueError("invalid transfer-call accounting")
             expected_copy = 4 * front["vocab"] if role == "coordinator" and not compact else 0
             if event["last_logits_copy_bytes"] != expected_copy:
@@ -165,10 +175,17 @@ def analyze(folder, connection):
             row[role + "_tcp_detail"] = event
         diagnostic[role] = {
             "reserved_bytes": detail["reserved_bytes"],
+            "coalesced_frames": sum(bool(item["send"].get("combined_send_bytes")) for item in requests),
+            "transfer_durations": {
+                kind: {key: distribution([item[kind][key] for item in requests if item[kind].get(key) is not None])
+                       for key in ("first_byte_ms", "header_ms", "payload_ms", "combined_send_ms")}
+                for kind in ("send", "receive")
+            },
             "last_logits_copy_bytes": sum(item["last_logits_copy_bytes"] for item in requests),
             "last_logits_copy_ms": distribution(
                 [item["last_logits_copy_ms"] for item in requests if item["last_logits_copy_ms"] is not None]),
-            **{kind: {key: sum(item[kind][key] for item in requests) for key in requests[0][kind]}
+            **{kind: {key: sum(item[kind][key] for item in requests if item[kind][key] is not None)
+                      if any(item[kind][key] is not None for item in requests) else None for key in requests[0][kind]}
                for kind in ("send", "receive")},
         }
     return {
@@ -194,6 +211,7 @@ def analyze(folder, connection):
         "protocol_version": 2 if compact else 1,
         "logits_response": front.get("logits_response", "full"),
         "worker_compact_responses": worker.get("compact_responses"),
+        "transport": {"coordinator": front.get("transport"), "worker": worker.get("transport")},
         "diagnostic": diagnostic,
         "alternatives": None if compact else alternatives(rows, sent, received, front["vocab"]),
         "requests": rows,
