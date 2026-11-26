@@ -255,7 +255,7 @@ def generation(exe, model, root, label):
     run(command(exe, "baseline", model, 0, "mmap", profiled, label) + options + ["--perf-details"],
         root / "profile-baseline.log")
     with start_worker(exe, model, "mmap", profiled_worker, label,
-                      extra=worker_options + ["--perf-details"]) as (child, port, _):
+                      extra=worker_options + ["--projection-perf-details"]) as (child, port, _):
         run(command(exe, "coordinator", model, port, "mmap", profiled_front, label) +
             options + ["--perf-details"], root / "profile-front.log")
         verify(child.wait(timeout=15) == 0, "profile Worker failed")
@@ -275,10 +275,10 @@ def generation(exe, model, root, label):
     compact_front = root / "compact-front"
     compact_worker = root / "compact-worker"
     with start_worker(exe, model, "mmap", compact_worker, label,
-                      extra=worker_options + ["--tcp-perf-details", "--tcp-nodelay", "1",
+                      extra=worker_options + ["--tcp-perf-details", "--projection-perf-details", "--tcp-nodelay", "1",
                                               "--tcp-small-frame-coalesce", "1"]) as (child, port, worker_log):
         compact_log = run(command(exe, "coordinator", model, port, "mmap", compact_front, label) +
-                          options + ["--tcp-perf-details", "--logits-response", "worker-greedy"],
+                          options + ["--tcp-perf-details", "--projection-perf-details", "--logits-response", "worker-greedy"],
                           root / "compact-front.log")
         verify(child.wait(timeout=15) == 0, "compact Worker failed")
         verify(re.findall(r"tx type=([89]) request=\d+", worker_log.read_text(errors="replace")) ==
@@ -287,6 +287,7 @@ def generation(exe, model, root, label):
            "compact generation differs")
     compact_summaries, _ = analyze["compare"]([prefix.with_suffix(".metrics.json") for prefix in (
         profiled, compact_front, compact_worker)])
+    verify(compact_summaries[1]["projection_detail"]["requests"] == [], "non-output stage recorded a head")
     front_transport, worker_transport = (data["transport"] for data in compact_summaries[1:])
     verify(not front_transport["nodelay_requested"] and not front_transport["small_frame_coalesce"] and
            worker_transport["nodelay_effective"] and worker_transport["small_frame_coalesce"],
@@ -295,6 +296,16 @@ def generation(exe, model, root, label):
     verify([item["combined_send_bytes"] for item in sends] == [36, 40, 40, 40, 40] and
            all(item["header_ms"] is None and item["payload_ms"] is None and item["calls"] >= 1 for item in sends),
            "compact frame metrics are inconsistent")
+    for worker_summary in (summaries[2], compact_summaries[2]):
+        projection = worker_summary["projection_detail"]
+        rows = projection["requests"]
+        verify(projection["dropped"] == 0 and projection["head"]["op"] == "MUL_MAT" and
+               [(row["request_id"], row["position"], row["output_rows"]) for row in rows] ==
+               [(index, pos, count) for index, (pos, count) in enumerate(expected, 1)] and
+               all(row["projection_calls"] == 1 and row["projection_segment_ms"] >= 0 for row in rows),
+               "projection timing does not match the executed graph")
+    verify([row["response_kind"] for row in compact_summaries[2]["projection_detail"]["requests"]] ==
+           [8, 9, 9, 9, 9], "projection timings lost compact response kinds")
     counters = compact_summaries[2]["compact_responses"]
     verify(counters["validated_logits_rows"] == 6 and counters["transmitted_logits_rows"] == 0 and
            counters["status_only"] == 1 and counters["transmitted_token_ids"] == 4,
@@ -541,7 +552,12 @@ def compact_failures(exe, model, root, label):
                         peer.sendall(frame(8 if scenario == "wrong-kind" else 9,
                                            2 if scenario == "session" else 1,
                                            2 if scenario == "request" else 1, body, version=2))
-                    verify(read_frame(peer, 2)[0] == 6, "failed session continued")
+                    try:
+                        verify(read_frame(peer, 2)[0] == 6, "failed session continued")
+                    except ConnectionResetError:
+                        # Rejecting the header can close with unread payload bytes at Winsock.
+                        if scenario != "extra-data":
+                            raise
 
             future = pool.submit(scripted_worker)
             output = root / ("compact-" + scenario)

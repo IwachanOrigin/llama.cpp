@@ -233,6 +233,7 @@ struct options {
     bool chat = false;
     bool perf_details = false;
     uint32_t expert_trace_limit = 0;
+    bool projection_perf_details = false;
     bool tcp_perf_details = false, tcp_nodelay = false, tcp_coalesce = false;
     uint32_t expert_io_trace_limit = 0;
     uint32_t expert_prefetch_depth = 0;
@@ -321,6 +322,10 @@ static void parse_options(options & cfg, int argc, char ** argv) {
         }
         if (key == "--chat") {
             cfg.chat = true;
+            continue;
+        }
+        if (key == "--projection-perf-details") {
+            cfg.projection_perf_details = cfg.perf_details = true;
             continue;
         }
         if (key == "--perf-details" || key == "--tcp-perf-details") {
@@ -470,6 +475,32 @@ struct stage {
     uint32_t begin, end;
     uint32_t hidden, vocab;
     stage_performance * perf;
+    bool projection_enabled = false;
+    steady_clock::time_point norm_done{};
+    const ggml_tensor * projection = nullptr;
+    bool recording_projection = false;
+    uint32_t projection_calls = 0;
+    double projection_ms = 0;
+
+    static bool eval_projection(ggml_tensor * tensor, bool ask, void * user) {
+        auto & self = *static_cast<stage *>(user);
+        const bool norm = std::strcmp(tensor->name, "result_norm") == 0;
+        const bool head = std::strcmp(tensor->name, "result_output") == 0;
+        if (norm || head) {
+            if (!ask && self.recording_projection) {
+                if (norm) {
+                    self.norm_done = steady_clock::now();
+                } else if (self.norm_done != steady_clock::time_point{}) {
+                    self.projection_ms += stage_performance::elapsed(self.norm_done);
+                    self.norm_done = {};
+                    ++self.projection_calls;
+                    self.projection = tensor;
+                }
+            }
+            return true;
+        }
+        return !self.output.generation && artifacts::eval(tensor, ask, &self.output);
+    }
 
     explicit stage(const options & cfg, stage_performance * details) : output(cfg.output), perf(details) {
         output.generation = cfg.generate;
@@ -506,6 +537,13 @@ struct stage {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.cb_eval = cfg.generate ? nullptr : artifacts::eval;
         cp.cb_eval_user_data = &output;
+        projection_enabled = cfg.projection_perf_details;
+        if (projection_enabled) {
+            cp.cb_eval = eval_projection;
+            cp.cb_eval_user_data = this;
+            perf->summary["projection_detail"] = {{"limit", 4096}, {"dropped", 0},
+                {"requests", nlohmann::json::array()}};
+        }
         const auto context_start = perf ? steady_clock::now() : steady_clock::time_point{};
         context.reset(llama_init_from_model(model.get(), cp));
         require(bool(context), "cannot create stage context");
@@ -555,7 +593,15 @@ struct stage {
         if (trace) trace->decoding = std::strcmp(phase, "decode") == 0;
         const auto before = sample ? llama_get_pager_metrics(model.get()) : llama_pager_metrics{};
         const auto start = steady_clock::now();
+        if (projection_enabled) {
+            projection = nullptr;
+            projection_ms = 0;
+            projection_calls = 0;
+            norm_done = {};
+            recording_projection = true;
+        }
         const auto status = llama_decode(context.get(), batch);
+        recording_projection = false;
         if (status && trace && !trace->reads.empty()) {
             trace->save_io(trace->io_prefix, false);
         }
@@ -567,6 +613,27 @@ struct stage {
             const auto after = llama_get_pager_metrics(model.get());
             sample->pager = stage_performance::delta(after, before);
             sample->pager_valid = true;
+        }
+        if (projection_enabled && projection) {
+            auto & detail = perf->summary["projection_detail"];
+            auto & requests = detail["requests"];
+            if (requests.size() < 4096) {
+                requests.push_back({{"request_id", request}, {"position", batch.pos[0]}, {"phase", phase},
+                    {"tokens", batch.n_tokens}, {"projection_calls", projection_calls},
+                    {"output_rows", projection->ne[1]}, {"output_bytes", ggml_nbytes(projection)},
+                    {"projection_segment_ms", projection_ms}});
+                if (!detail.contains("head")) {
+                    const auto describe = [](const ggml_tensor * tensor) {
+                        return nlohmann::json{{"name", tensor->name}, {"type", ggml_type_name(tensor->type)},
+                            {"shape", tensor->ne}, {"strides", tensor->nb}, {"bytes", ggml_nbytes(tensor)},
+                            {"buffer_type", tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : nullptr}};
+                    };
+                    detail["head"] = {{"op", ggml_op_name(projection->op)}, {"output", describe(projection)},
+                        {"weight", describe(projection->src[0])}, {"activation", describe(projection->src[1])}};
+                }
+            } else {
+                detail["dropped"] = detail["dropped"].get<uint32_t>() + 1;
+            }
         }
         if (trace) {
             trace->requests.push_back({{"request_id", request}, {"position", batch.pos[0]},
@@ -775,20 +842,27 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
         put(result, count);
         put(result, local.vocab);
         if (compact) {
+            const bool measure = local.projection_enabled;
+            double lookup_ms = 0, finite_ms = 0, sample_ms = 0;
             const auto validation_start = sample ? steady_clock::now() : steady_clock::time_point{};
             llama_token selected = -1;
             for (uint32_t row = 0; row < count; ++row) {
+                const auto lookup_start = measure ? steady_clock::now() : steady_clock::time_point{};
                 const auto * values = llama_get_logits_ith(local.context.get(), row);
+                if (measure) lookup_ms += stage_performance::elapsed(lookup_start);
+                const auto scan_start = measure ? steady_clock::now() : steady_clock::time_point{};
                 require(values && local.vocab, "missing logits");
                 if (response_kind == greedy_token && row + 1 == count) {
                     const auto greedy_start = sample ? steady_clock::now() : steady_clock::time_point{};
                     if (sample) validation_ms += stage_performance::elapsed(validation_start);
                     selected = greedy(values, local.vocab);
+                    if (measure) sample_ms += stage_performance::elapsed(scan_start);
                     if (sample) greedy_ms += stage_performance::elapsed(greedy_start);
                 } else {
                     for (uint32_t col = 0; col < local.vocab; ++col) {
                         require(std::isfinite(values[col]), "non-finite logits");
                     }
+                    if (measure) finite_ms += stage_performance::elapsed(scan_start);
                 }
             }
             if (response_kind == greedy_token) {
@@ -799,6 +873,17 @@ static void worker(const options & cfg, stage & local, channel & wire, state & s
                 ++status_responses;
             }
             checked_rows += count;
+            if (measure) {
+                auto & rows = perf->summary["projection_detail"]["requests"];
+                if (!rows.empty() && rows.back()["request_id"] == request) {
+                    auto & row = rows.back();
+                    row["response_kind"] = response_kind;
+                    row["logits_accessor_ms"] = lookup_ms;
+                    row["validation_only_ms"] = finite_ms;
+                    row["greedy_with_validation_ms"] = sample_ms;
+                    row["validated_rows"] = count;
+                }
+            }
         } else {
             local.logits(result, count);
         }
