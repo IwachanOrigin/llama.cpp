@@ -1340,7 +1340,18 @@ static int transport_benchmark(int argc, char ** argv) {
     return 0;
 }
 
+#include <condition_variable>
+#include <ctime>
+#include "stage-reader-bench.h"
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "reader-bench") == 0) {
+        try { return reader_bench::run(argc, argv); }
+        catch (const std::exception & error) {
+            std::fprintf(stderr, "Reader benchmark failed: %s\n", error.what());
+            return 1;
+        }
+    }
     if (argc > 1 && std::strcmp(argv[1], "transport-bench") == 0) {
         try { return transport_benchmark(argc, argv); }
         catch (const std::exception & error) {

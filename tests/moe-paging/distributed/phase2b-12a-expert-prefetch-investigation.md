@@ -281,3 +281,5 @@ bytes), each with one transient slot. The Depth 1 staging slab held
 record array uses up to 14,400,000 diagnostic bytes for 200,000
 access slots per role, accounted separately from the Pager budget.
 No larger runtime Prefetch depth or extra Reader was implemented.
+
+See [Phase 2B-12B-0](phase2b-12b0-expert-reader-benchmark.md) for the separate model-free Reader benchmark.

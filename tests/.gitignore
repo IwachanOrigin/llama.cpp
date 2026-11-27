@@ -32,3 +32,8 @@ ggml-common.h
 **/*.swp
 !peg-parser
 !moe-paging/distributed/analyze-expert-prefetch-latency.py
+!moe-paging/distributed/stage-reader-bench.h
+!moe-paging/distributed/prepare-expert-reader-bench.py
+!moe-paging/distributed/analyze-expert-reader-bench.py
+!moe-paging/distributed/test-expert-reader-bench.py
+!moe-paging/distributed/run-expert-reader-bench.sh
