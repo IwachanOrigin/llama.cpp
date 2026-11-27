@@ -225,3 +225,12 @@ schedule; generated IDs and UTF-8, Expert artifacts and access
 order, Pager counters and wire byte counts were also equal.
 Use the 16-token same-build paired run as the primary check of the
 diagnostic toggle. The 64-token control is the retained 10D run.
+
+## Intel 11A-W and priority for 12A
+
+In the supplied Intel run, the first Projection took 824.232 ms.
+The remaining intermediate Prefill Projection requests averaged
+16.702 ms. Skipping early rows can move first-touch costs to final
+Prefill. Both stages reported 13.962 s aggregate Prefetch wait.
+Keep 11B pending and reevaluate Projection with longer prompts
+or larger batches. See [Phase 2B-12A](phase2b-12a-expert-prefetch-investigation.md).

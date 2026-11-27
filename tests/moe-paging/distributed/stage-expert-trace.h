@@ -23,6 +23,7 @@ struct stage_expert_trace {
     };
 
     std::vector<event> events;
+    std::vector<llama_expert_cache::delivery_sample> delivery_timing;
     struct reader_event {
         size_t index;
         llama_expert_io_sample sample;
@@ -33,11 +34,13 @@ struct stage_expert_trace {
     bool prefetch_enabled = false;
     mutable std::mutex reader_trace_mutex;
 
-    static void capture_delivery(void * context, uint64_t id, bool waited) noexcept {
+    static void capture_delivery(void * context, uint64_t id, bool waited,
+                                 const llama_expert_cache::delivery_sample & sample) noexcept {
         auto & trace = *static_cast<stage_expert_trace *>(context);
         if (trace.seen && trace.seen <= trace.events.size()) {
             trace.events[trace.seen - 1].prefetch_id = id;
             trace.events[trace.seen - 1].prefetch_waited = waited;
+            if (trace.seen <= trace.delivery_timing.size()) trace.delivery_timing[trace.seen - 1] = sample;
         }
     }
 
@@ -86,6 +89,18 @@ struct stage_expert_trace {
                 }
             }
             delivery.close();
+            std::ofstream timing(std::filesystem::u8path(prefix + ".prefetch-timing.jsonl"), std::ios::binary);
+            timing.exceptions(std::ios::badbit | std::ios::failbit);
+            timing << json({{"version", 1}, {"limit", delivery_timing.size()},
+                {"dropped_accesses", seen - std::min(seen, delivery_timing.size())},
+                {"complete", ! (reads_seen > reads.size() || seen > delivery_timing.size())}}).dump() << '\n';
+            for (size_t index = 0; index < std::min(seen, delivery_timing.size()); ++index) {
+                if (!events[index].prefetch_id) continue;
+                const auto & t = delivery_timing[index];
+                timing << json::array({index, events[index].prefetch_id, t.submit, t.reader_start, t.reader_end,
+                    t.ready, t.demand_begin, t.wait_begin, t.wait_end, t.previous_compute_begin,
+                    t.previous_compute_end}).dump() << '\n';
+            }
         }
     }
     std::vector<llama_expert_cache::decision> decisions;

@@ -104,7 +104,11 @@ public:
     prefetch_statistics prefetch_stats() const;
     static size_t prefetch_bytes(size_t max_expert_bytes);
     static uint64_t prefetch_reader_id() noexcept;
-    using delivery_fn = void (*)(void *, uint64_t, bool) noexcept;
+    struct delivery_sample {
+        uint64_t submit, reader_start, reader_end, ready, demand_begin, wait_begin, wait_end,
+                 previous_compute_begin, previous_compute_end;
+    };
+    using delivery_fn = void (*)(void *, uint64_t, bool, const delivery_sample &) noexcept;
     void set_prefetch_delivery_trace(delivery_fn callback, void * context) noexcept;
     statistics stats() const;
     void set_decision_trace(decision_fn callback, void * context) noexcept;

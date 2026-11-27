@@ -164,6 +164,7 @@ struct llama_expert_cache::prefetch_state {
     size_t bytes = 0;
     unsigned char * data = nullptr;
     uint64_t start_ns = 0, end_ns = 0;
+    uint64_t submit_ns = 0, ready_ns = 0, trace_compute_end_ns = 0;
     uint64_t compute_from_ns = 0, compute_to_ns = 0;
 
     void account_overlap() {
@@ -238,6 +239,7 @@ void llama_expert_cache::prefetch_loop() {
             ++job.stats.reads_failed;
         }
         job.status = success ? prefetch_state::state::ready : prefetch_state::state::failed;
+        if (job.delivery && success) job.ready_ns = timestamp_ns();
         if (job.discard) {
             discard_prefetch();
         }
@@ -294,6 +296,10 @@ void llama_expert_cache::try_prefetch(const void * scope, key expert, size_t byt
     job.discard = false;
     job.start_ns = job.end_ns = 0;
     job.compute_from_ns = job.compute_to_ns = 0;
+    if (job.delivery) {
+        job.submit_ns = timestamp_ns();
+        job.ready_ns = job.trace_compute_end_ns = 0;
+    }
     job.status = prefetch_state::state::queued;
     ++job.stats.issued;
     job.stats.peak_in_use = 1;
@@ -310,6 +316,7 @@ void llama_expert_cache::compute_end(const void * scope, uint64_t begin) {
     if (pending && pending->scope == scope && !pending->discard) {
         pending->compute_from_ns = begin;
         pending->compute_to_ns = end;
+        if (pending->delivery) pending->trace_compute_end_ns = end;
         pending->account_overlap();
     }
 }
@@ -576,6 +583,7 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes, 
     if (expert.expert_id < 0 || !bytes || bytes > max_expert_bytes) {
         return {};
     }
+    const auto demand_begin = pending && pending->delivery ? timestamp_ns() : 0;
     std::unique_lock<std::mutex> lock(mutex);
     const size_t residents = slot_count - (frequency != nullptr);
     const auto wait = [&](bool for_capacity, bool for_transient = false) {
@@ -704,12 +712,16 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes, 
         auto & job = *pending;
         if (same_key(expert, job.expert) && bytes == job.bytes && !job.discard) {
             const bool waited = job.status == prefetch_state::state::queued || job.status == prefetch_state::state::reading;
+            uint64_t wait_begin_ns = 0, wait_end_ns = 0;
             if (waited) {
                 const auto wait_start = cache_clock::now();
+                if (job.delivery) wait_begin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        wait_start.time_since_epoch()).count();
                 ++job.stats.wait_count;
                 changed.wait(lock, [&] {
                     return job.status != prefetch_state::state::queued && job.status != prefetch_state::state::reading;
                 });
+                if (job.delivery) wait_end_ns = timestamp_ns();
                 job.stats.wait_ns += elapsed_ns(wait_start);
             }
             if (job.status == prefetch_state::state::ready) {
@@ -721,7 +733,9 @@ llama_expert_cache::lease llama_expert_cache::acquire(key expert, size_t bytes, 
                     ++job.stats.consumed_ready;
                 }
                 if (job.delivery) {
-                    job.delivery(job.delivery_context, job.stats.issued, waited);
+                    job.delivery(job.delivery_context, job.stats.issued, waited,
+                            {job.submit_ns, job.start_ns, job.end_ns, job.ready_ns, demand_begin,
+                             wait_begin_ns, wait_end_ns, job.compute_from_ns, job.trace_compute_end_ns});
                 }
                 job.status = prefetch_state::state::empty;
                 job.scope = nullptr;

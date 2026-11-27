@@ -353,6 +353,23 @@ def generation(exe, model, root, label):
            tiny_metrics["prefetch"]["in_use"] == 0, "prefetch I/O was not delivered during generation")
     verify(replay["misses"] == pager["cache_misses"] and replay["events"] == pager["frequency_updates"] and
            replay["bypassed"] > 0 and not pager["transient_in_use"], "TinyLFU metrics differ from replay")
+    latency = runpy.run_path(str(Path(__file__).with_name("analyze-expert-prefetch-latency.py")))["analyze"]
+    observed = latency(root, tinylfu.name, [Path(model)])
+    verify(observed["timing_available"] and
+           observed["intervals"]["all_delivered"]["service"]["count"] == decoded_io["consumed"] and
+           all(case["estimated_bytes"] <= case["budget_bytes"] for case in observed["simulation"]),
+           "prefetch timeline does not reconcile")
+    sidecar = tinylfu.with_suffix(".prefetch-timing.jsonl")
+    saved = sidecar.read_text()
+    sidecar.write_text("\n".join(saved.splitlines()[:-1]) + "\n")
+    try:
+        latency(root, tinylfu.name, [Path(model)])
+    except ValueError as exc:
+        verify("missing delivery" in str(exc), "unexpected timing trace error")
+    else:
+        raise RuntimeError("incomplete timing trace was accepted")
+    finally:
+        sidecar.write_text(saved)
     one_thread = []
     for depth in ("0", "1"):
         sample = root / ("one-thread-depth-" + depth)

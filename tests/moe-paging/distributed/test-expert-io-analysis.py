@@ -16,6 +16,31 @@ def fixture(path, name=b"blk.0.ffn_gate_exps.weight"):
     path.write_bytes(metadata + bytes(-len(metadata) % 32 + 288))
 
 
+class PrefetchTiming(unittest.TestCase):
+    def test_decomposition(self):
+        tools = runpy.run_path(str(Path(__file__).with_name("analyze-expert-prefetch-latency.py")))
+        row = (1, 3, 10, 12, 40, 42, 25, 27, 45, 14, 24)
+        timing = tools["decompose"](row, True)
+        self.assertEqual((timing["queue"], timing["wait"], timing["resume"], timing["overlap"]), (2, 18, 3, 10))
+        with self.assertRaises(ValueError):
+            tools["decompose"](row, False)
+        with self.assertRaises(ValueError):
+            tools["decompose"](row[:3] + (9,) + row[4:], True)
+        self.assertIsNone(tools["distribution"]([]))
+        self.assertEqual(tools["distribution"]([4, 1, 2, 3])["p50_ns"], 2)
+
+    def test_bounded_tensor_replay(self):
+        tools = runpy.run_path(str(Path(__file__).with_name("analyze-expert-prefetch-latency.py")))
+        replay = tools["replay"]
+        groups = [[((0, 0), 32, 0), ((0, 1), 32, 0), ((0, 2), 32, 0)], [((1, 0), 32, 0)]]
+        off, one, two = (replay(groups, d, 4, r, {32: 10}, 2, {0}, "lru")
+                         for d, r in ((0, 1), (1, 1), (2, 2)))
+        self.assertEqual([x["reads"] for x in (off, one, two)], [4, 4, 4])
+        self.assertEqual(one["issued"], 2)
+        self.assertEqual(two["issued"], 2)
+        self.assertLess(two["modeled_expert_loop_ns"], one["modeled_expert_loop_ns"])
+
+
 class ExpertIO(unittest.TestCase):
     def test_ranges(self):
         check = TOOLS["checked_end"]

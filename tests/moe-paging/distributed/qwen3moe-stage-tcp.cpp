@@ -556,6 +556,7 @@ struct stage {
                 trace->reads.resize(cfg.expert_io_trace_limit);
                 llama_set_expert_io_trace(model.get(), stage_expert_trace::capture_io, trace.get());
                 if (cfg.expert_prefetch_depth) {
+                    trace->delivery_timing.resize(cfg.expert_trace_limit);
                     llama_set_expert_prefetch_delivery_trace(model.get(), stage_expert_trace::capture_delivery, trace.get());
                 }
             }
